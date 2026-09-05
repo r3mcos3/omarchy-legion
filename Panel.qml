@@ -28,6 +28,7 @@ Panel {
   property var notifications: []
   property var tasks: []
   property var usage: null
+  property bool soundEnabled: true
   property string listError: ""
   property string formError: ""
 
@@ -109,6 +110,18 @@ Panel {
     })
   }
 
+  function refreshSettings() {
+    runJson(["settings", "--json"], function(code, text) {
+      if (code !== 0) return
+      try {
+        var v = JSON.parse(text)
+        root.soundEnabled = (v && typeof v === "object") ? (v.soundEnabled !== false) : true
+      } catch (e) { /* keep last known value */ }
+    })
+  }
+
+  function toggleSound() { runAction(["settings", "sound", root.soundEnabled ? "off" : "on"]) }
+
   function refreshTasks() {
     runJson(["tasks", "list", "--json"], function(code, text) {
       if (code !== 0) return
@@ -122,6 +135,7 @@ Panel {
     refreshUsage()
     refreshNotifications()
     refreshTasks()
+    refreshSettings()
   }
 
   // --- actions (mutating) --------------------------------------------------
@@ -579,11 +593,30 @@ Panel {
           PanelSeparator { width: parent.width; foreground: root.foreground }
 
           // --- notifications -------------------------------------------------
-          PanelSectionHeader {
+          Row {
             width: parent.width
-            text: "MELDINGEN"
-            foreground: root.foreground
-            fontFamily: root.fontFamily
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              text: "MELDINGEN"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+            ToggleSwitch {
+              anchors.verticalCenter: parent.verticalCenter
+              checked: root.soundEnabled
+              busy: root.actionBusy
+              foreground: root.foreground
+              onToggled: root.toggleSound()
+            }
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: "geluid"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
           }
 
           Text {

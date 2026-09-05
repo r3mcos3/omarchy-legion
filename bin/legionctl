@@ -18,6 +18,7 @@ usage_error() {
   members add NAME CWD |
   session start|stop|restart NAME |
   terminal open NAME AGENT_ID |
+  settings --json | settings sound on|off |
   start-all'
 }
 
@@ -527,9 +528,38 @@ read_marker() {
   read_json_or "$notify_marker_path" '{"lastSeenTs":0,"taskStatuses":{},"transcripts":{},"unseen":[],"pendingAnswers":{}}'
 }
 
+# --- settings -----------------------------------------------------------
+#
+# Small, separate from the notify marker on purpose: a marker tracks
+# transient polling state (offsets, what's been seen) and gets reset/
+# reasoned about as a whole; a setting is a standing preference that has
+# no business being touched by that logic.
+settings_path=$HOME/.config/omarchy/legion-settings.json
+
+read_settings() {
+  read_json_or "$settings_path" '{"soundEnabled":true}'
+}
+
+cmd_settings_get() {
+  read_settings
+}
+
+cmd_settings_set_sound() {
+  local value=$1 enabled
+  case $value in
+    on) enabled=true ;;
+    off) enabled=false ;;
+    *) die 2 "sound must be on or off" ;;
+  esac
+  mkdir -p -- "$(dirname -- "$settings_path")"
+  jq --argjson e "$enabled" '.soundEnabled = $e' <<<"$(read_settings)" > "$settings_path"
+  jq -n --argjson e "$enabled" '{ok:true, soundEnabled:$e}'
+}
+
 notification_sound_path=/usr/share/sounds/freedesktop/stereo/complete.oga
 
 play_notification_sound() {
+  [[ $(jq -r '.soundEnabled // true' <<<"$(read_settings)") == true ]] || return 0
   [[ -f $notification_sound_path ]] || return 0
   command -v pw-play >/dev/null 2>&1 || return 0
   pw-play -- "$notification_sound_path" >/dev/null 2>&1 &
@@ -906,6 +936,20 @@ case $command_name in
       open)
         (($# == 4)) || usage_error
         cmd_terminal_open "$3" "$4"
+        ;;
+      *) usage_error ;;
+    esac
+    ;;
+  settings)
+    subcommand=${2:-}
+    case $subcommand in
+      --json)
+        (($# == 2)) || usage_error
+        cmd_settings_get
+        ;;
+      sound)
+        (($# == 3)) || usage_error
+        cmd_settings_set_sound "$3"
         ;;
       *) usage_error ;;
     esac

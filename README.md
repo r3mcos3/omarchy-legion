@@ -36,7 +36,11 @@ install and get value from.
   broad, see "Standalone message detection" below. Suppressed only when
   that specific member's own terminal window (opened via the panel's
   "terminal" button) currently has focus — you're already looking at it.
-  Checked every 15s, independently of whether the panel is open.
+  Checked every 15s, independently of whether the panel is open. The chime
+  has its own on/off switch next to the "MELDINGEN" header
+  (`~/.config/omarchy/legion-settings.json`, `{"soundEnabled": ...}`) —
+  the desktop toast and blink stay on regardless, only the sound is
+  affected.
 - **Verbruik** — 5h/7d rate-limit percentage from
   `~/.claude/usage-cache.json`, with exact reset times on hover.
 - **Lid toevoegen** — name + absolute workspace path (mkdir, sets
