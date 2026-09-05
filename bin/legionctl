@@ -17,6 +17,7 @@ usage_error() {
   tasks list --json | tasks add MEMBER TITLE | tasks send ID [MESSAGE] | tasks done ID |
   members add NAME CWD |
   session start|stop|restart NAME |
+  terminal open NAME AGENT_ID |
   start-all'
 }
 
@@ -365,6 +366,43 @@ is_terminal_focused() {
   command -v hyprctl >/dev/null 2>&1 || return 1
   active_title=$(hyprctl activewindow -j 2>/dev/null | jq -r '.initialTitle // empty' 2>/dev/null) || return 1
   [[ $active_title == "legion:$name" ]]
+}
+
+# Existing window's hyprctl address for a member's terminal (matched the
+# same way as is_terminal_focused above), or empty if none is open.
+find_terminal_window() {
+  local name=$1
+  command -v hyprctl >/dev/null 2>&1 || return 0
+  hyprctl clients -j 2>/dev/null | jq -r --arg t "legion:$name" \
+    '[.[] | select(.initialTitle == $t)][0].address // empty' 2>/dev/null
+}
+
+# Opens a floating terminal for a member, or — if one is already open —
+# moves that SAME window to the current workspace and focuses it instead
+# of opening a second one (clicking "terminal" twice used to spawn two
+# windows attached to the same session). hl.dsp.* is this Hyprland's
+# newer Lua-based dispatch API (0.56+, confirmed live against the actual
+# running compositor); the classic string form is kept as a fallback for
+# older builds, the same defensive pattern Omarchy's own
+# omarchy-launch-or-focus script uses for the focus half of this.
+cmd_terminal_open() {
+  local name=$1 agent_id=$2 addr active_ws
+  addr=$(find_terminal_window "$name")
+
+  if [[ -n $addr ]]; then
+    active_ws=$(hyprctl activeworkspace -j 2>/dev/null | jq -r '.id // empty')
+    if [[ -n $active_ws ]]; then
+      hyprctl dispatch "hl.dsp.window.move({ window = \"address:$addr\", workspace = \"$active_ws\", follow = false })" \
+        >/dev/null 2>&1 || hyprctl dispatch movetoworkspacesilent "$active_ws,address:$addr" >/dev/null 2>&1 || true
+    fi
+    hyprctl dispatch "hl.dsp.focus({ window = \"address:$addr\" })" \
+      >/dev/null 2>&1 || hyprctl dispatch focuswindow "address:$addr" >/dev/null 2>&1 || true
+    jq -n '{ok:true, note:"focused existing window"}'
+    return 0
+  fi
+
+  setsid alacritty --class TUI.float --title "legion:$name" -e claude attach "$agent_id" >/dev/null 2>&1 &
+  jq -n '{ok:true, note:"opened new window"}'
 }
 
 notify_generic_message() {
@@ -859,6 +897,16 @@ case $command_name in
       start) cmd_session_start "$name" ;;
       stop) cmd_session_stop "$name" ;;
       restart) cmd_session_restart "$name" ;;
+      *) usage_error ;;
+    esac
+    ;;
+  terminal)
+    subcommand=${2:-}
+    case $subcommand in
+      open)
+        (($# == 4)) || usage_error
+        cmd_terminal_open "$3" "$4"
+        ;;
       *) usage_error ;;
     esac
     ;;

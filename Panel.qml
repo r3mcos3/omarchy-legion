@@ -159,19 +159,13 @@ Panel {
     }
   }
 
-  // TUI.float is Omarchy's own built-in app-id for ad-hoc floating TUI
-  // windows (see /usr/share/omarchy/default/hypr/apps/system.lua: tagged
-  // +floating-window, which carries float/center/size 875x600) — reusing it
-  // means this needs no window rule of its own. omarchy-launch-terminal (the
-  // portable, any-terminal way to spawn one) has no way to pass a class
-  // through, so this launches Alacritty directly, matching this system's
-  // actual configured default terminal. --title "legion:<name>" is how
-  // legionctl's is_terminal_focused() tells one member's terminal apart from
-  // another's later — they all share the "TUI.float" class (needed for the
-  // floating rule above), so the title is the only per-member handle left.
-  function openTerminalFor(id, name) {
-    Quickshell.execDetached(["alacritty", "--class", "TUI.float", "--title", "legion:" + name, "-e", "claude", "attach", id])
-  }
+  // Routed through legionctl's "terminal open" instead of spawning Alacritty
+  // straight from here, so a second click on the same member's row finds and
+  // refocuses the window it already opened (moved to the current workspace)
+  // rather than opening a duplicate one attached to the same session. See
+  // cmd_terminal_open in bin/legionctl for the TUI.float / --title
+  // "legion:<name>" matching convention this depends on.
+  function openTerminalFor(id, name) { runAction(["terminal", "open", name, id]) }
 
   function startAll() { runAction(["start-all"]) }
 
