@@ -355,6 +355,15 @@ read_marker() {
   read_json_or "$notify_marker_path" '{"lastSeenTs":0,"taskStatuses":{},"transcript":{"path":"","offset":0}}'
 }
 
+notification_sound_path=/usr/share/sounds/freedesktop/stereo/complete.oga
+
+play_notification_sound() {
+  [[ -f $notification_sound_path ]] || return 0
+  command -v pw-play >/dev/null 2>&1 || return 0
+  pw-play -- "$notification_sound_path" >/dev/null 2>&1 &
+  disown
+}
+
 cmd_notifications_check() {
   local marker last_seen prev_statuses tasks transitions count
 
@@ -393,6 +402,7 @@ cmd_notifications_check() {
       "$headline" "$body" \
       --exec omarchy-shell r3mcos3.legion toggle \
       >/dev/null 2>&1 || true
+    play_notification_sound
     i=$((i + 1))
   done
 
