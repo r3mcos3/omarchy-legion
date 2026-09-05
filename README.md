@@ -27,6 +27,17 @@ install and get value from.
 - **Meldingen** — tails the webapp's own `log-history.json`, so it shows the
   same notification feed without re-implementing any of the transcript-diffing
   logic that produces it.
+- **Meldingen (proactief)** — a real desktop notification (via
+  `omarchy-notification-send`, clickable to open the panel) plus a badge on
+  the bar icon, fired when a task you sent flips out of `in_progress` (the
+  webapp's own reply-detection advances it to `approved_questions`, or it's
+  marked done by hand in either UI). This is *not* the same signal the
+  webapp's own chime uses — that's an ephemeral in-memory broadcast over its
+  websocket to connected browser tabs, never written to disk, so a
+  file-polling plugin like this one has no way to observe it after the
+  fact. Task-status transitions in the shared `tasks.json` are a
+  file-based proxy for the same "a member is done" moment, checked every
+  15s regardless of whether the panel is open.
 - **Verbruik** — 5h/7d rate-limit percentage from
   `~/.claude/usage-cache.json`, with exact reset times on hover.
 - **Lid toevoegen** — name + absolute workspace path; mirrors the webapp's

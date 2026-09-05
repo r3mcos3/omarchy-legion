@@ -216,8 +216,43 @@ Panel {
   function sendTask(id) { runAction(["tasks", "send", id]) }
   function doneTask(id) { runAction(["tasks", "done", id]) }
 
+  // --- notifications (always on, independent of the panel being open) ------
+  //
+  // "Done with your task" isn't observable as a one-off event — it's a
+  // change in shared state (tasks.json's status field, flipped by the
+  // webapp's own reply detection or a manual "klaar"), so this polls for
+  // it rather than listening for a push. Runs constantly from
+  // Component.onCompleted, not just while the panel is open, since the
+  // whole point is finding out without having to check.
+  property int unseenCount: 0
+
+  function checkNotifications() {
+    runJson(["notifications", "check"], function(code, text) {
+      if (code !== 0) return
+      try {
+        var result = JSON.parse(text)
+        root.unseenCount = result.unseenCount || 0
+      } catch (e) { /* transient parse hiccup — next poll corrects it */ }
+    })
+  }
+
+  function markNotificationsSeen() {
+    root.unseenCount = 0
+    runJson(["notifications", "mark-seen"], function() {})
+  }
+
+  Timer {
+    id: notifyTimer
+    interval: 15000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.checkNotifications()
+  }
+
   onOpenedChanged: if (opened) {
     refreshAll()
+    markNotificationsSeen()
     refreshTimer.start()
   } else {
     refreshTimer.stop()
@@ -234,10 +269,11 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: ""
-    tooltipText: root.offlineCount > 0
-      ? "Legion — " + root.offlineCount + " offline"
-      : "Legion"
+    text: "\uf0c0"
+    tooltipText: [
+      root.offlineCount > 0 ? (root.offlineCount + " offline") : "",
+      root.unseenCount > 0 ? (root.unseenCount + " nieuw") : ""
+    ].filter(function(s) { return s !== "" }).join(" \u00b7 ") || "Legion"
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.LeftButton) root.toggle()
     }
@@ -251,6 +287,33 @@ Panel {
     border.width: 1
     border.color: Color.urgent
     visible: root.offlineCount > 0
+  }
+
+  // Unseen-notifications badge: a completed task is a change in shared
+  // state, not a one-off event to react to, so this is what "you weren't
+  // looking, but something happened" looks like here -- see checkNotifications.
+  Rectangle {
+    id: unseenBadge
+    visible: root.unseenCount > 0
+    width: Math.max(Style.space(14), badgeLabel.implicitWidth + Style.space(6))
+    height: Style.space(14)
+    radius: height / 2
+    color: Color.accent
+    anchors.top: button.top
+    anchors.right: button.right
+    anchors.topMargin: -Style.space(2)
+    anchors.rightMargin: -Style.space(2)
+
+    Text {
+      id: badgeLabel
+      anchors.centerIn: parent
+      textFormat: Text.PlainText
+      text: root.unseenCount > 99 ? "99+" : String(root.unseenCount)
+      color: Color.background
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      font.bold: true
+    }
   }
 
   KeyboardPanel {

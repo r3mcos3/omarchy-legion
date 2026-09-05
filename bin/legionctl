@@ -179,6 +179,84 @@ cmd_notifications() {
   read_json_or "$log_path" '[]' | jq --argjson n "$limit" '.[-$n:]'
 }
 
+# --- notify-check ------------------------------------------------------------
+#
+# What "done with your task" actually looks like in the shared state: the
+# webapp's own advanceTasksOnReply (triggered by its transcript poll, which
+# this plugin does NOT reimplement) flips a task's status from in_progress
+# to approved_questions the moment that member's reply lands, filling in
+# .reply. Marking a task done by hand is the other terminal transition.
+# There is no on-disk trace of the webapp's other, purely in-memory
+# "sound/browser-notification" signal (flushPendingNotify / pendingNotify) —
+# it's broadcast live over its own websocket to connected browser tabs and
+# never written anywhere, so it isn't something a file-polling plugin like
+# this one can observe after the fact. Tracking task-status transitions
+# instead is both fully file-based and a closer match for what was actually
+# asked: a notification when a task you sent is done, not every intermediate
+# peer message.
+notify_marker_path=$HOME/.config/omarchy/legion-notify-marker.json
+
+read_marker() {
+  read_json_or "$notify_marker_path" '{"lastSeenTs":0,"taskStatuses":{}}'
+}
+
+cmd_notifications_check() {
+  local marker last_seen prev_statuses entries tasks unseen_count transitions count
+
+  marker=$(read_marker)
+  last_seen=$(jq -r '.lastSeenTs // 0' <<<"$marker")
+  prev_statuses=$(jq -c '.taskStatuses // {}' <<<"$marker")
+
+  entries=$(read_json_or "$log_path" '[]')
+  unseen_count=$(jq --argjson since "$last_seen" '[.[] | select(.ts > $since)] | length' <<<"$entries")
+
+  tasks=$(load_tasks)
+  # Tasks that just moved OUT of in_progress since the last check (either
+  # auto-advanced to approved_questions by the webapp's reply detection, or
+  # marked done by hand from either UI).
+  transitions=$(jq --argjson prev "$prev_statuses" '
+    [.[] | select(($prev[.id] // "") == "in_progress" and .status != "in_progress")]
+  ' <<<"$tasks")
+
+  count=$(jq 'length' <<<"$transitions")
+  local i=0
+  while (( i < count )); do
+    local member title status reply headline body
+    member=$(jq -r --argjson i "$i" '.[$i].member' <<<"$transitions")
+    title=$(jq -r --argjson i "$i" '.[$i].title' <<<"$transitions")
+    status=$(jq -r --argjson i "$i" '.[$i].status' <<<"$transitions")
+    reply=$(jq -r --argjson i "$i" '.[$i].reply.text // ""' <<<"$transitions")
+    headline="$member — opdracht klaar"
+    body="\"$title\""
+    [[ $status == done ]] && body="$body (afgerond)"
+    [[ -n $reply ]] && body="$body: $reply"
+    omarchy-notification-send --app-name legion -u normal \
+      "$headline" "$body" \
+      --exec omarchy-shell r3mcos3.legion toggle \
+      >/dev/null 2>&1 || true
+    i=$((i + 1))
+  done
+
+  # Persist the full current status map (not just changed ones) so a task
+  # that goes in_progress again later (a follow-up message) is correctly
+  # seen as "was in_progress" on its next transition too.
+  local new_statuses
+  new_statuses=$(jq '[.[] | {key: .id, value: .status}] | from_entries' <<<"$tasks")
+  jq -n --argjson ts "$last_seen" --argjson statuses "$new_statuses" \
+    '{lastSeenTs:$ts, taskStatuses:$statuses}' > "$notify_marker_path"
+
+  jq -n --argjson fired "$count" --argjson unseen "$unseen_count" '{fired:$fired, unseenCount:$unseen}'
+}
+
+cmd_notifications_mark_seen() {
+  local now marker
+  now=$(date +%s%3N)
+  marker=$(read_marker)
+  mkdir -p -- "$(dirname -- "$notify_marker_path")"
+  jq --argjson ts "$now" '.lastSeenTs = $ts' <<<"$marker" > "$notify_marker_path"
+  jq -n --argjson ts "$now" '{ok:true, lastSeenTs:$ts}'
+}
+
 # --- tasks -------------------------------------------------------------------
 
 load_tasks() {
@@ -378,8 +456,25 @@ case $command_name in
     cmd_usage
     ;;
   notifications)
-    shift
-    cmd_notifications "$@"
+    subcommand=${2:-}
+    case $subcommand in
+      check)
+        (($# == 2)) || usage_error
+        cmd_notifications_check
+        ;;
+      mark-seen)
+        (($# == 2)) || usage_error
+        cmd_notifications_mark_seen
+        ;;
+      --limit)
+        shift
+        cmd_notifications "$@"
+        ;;
+      "")
+        cmd_notifications
+        ;;
+      *) usage_error ;;
+    esac
     ;;
   tasks)
     subcommand=${2:-}
