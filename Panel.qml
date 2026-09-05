@@ -62,11 +62,12 @@ Panel {
   Component {
     id: jsonProcComponent
     Process {
+      id: proc
       property string collectedText: ""
       signal runFinished(int exitCode)
       stdout: StdioCollector {
         waitForEnd: true
-        onStreamFinished: parent.collectedText = text
+        onStreamFinished: proc.collectedText = text
       }
       onExited: function(exitCode) { runFinished(exitCode) }
     }
@@ -148,12 +149,13 @@ Panel {
   Component {
     id: actionProcComponent
     Process {
+      id: proc
       property string stdoutText: ""
       property string stderrText: ""
-      signal runFinished(int exitCode, string stderrText)
-      stdout: StdioCollector { waitForEnd: true; onStreamFinished: parent.stdoutText = text }
-      stderr: StdioCollector { waitForEnd: true; onStreamFinished: parent.stderrText = text.trim() }
-      onExited: function(exitCode) { runFinished(exitCode, stderrText) }
+      signal runFinished(int exitCode, string stderrOutput)
+      stdout: StdioCollector { waitForEnd: true; onStreamFinished: proc.stdoutText = text }
+      stderr: StdioCollector { waitForEnd: true; onStreamFinished: proc.stderrText = text.trim() }
+      onExited: function(exitCode) { runFinished(exitCode, proc.stderrText) }
     }
   }
 
