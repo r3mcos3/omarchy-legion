@@ -159,8 +159,15 @@ Panel {
     }
   }
 
+  // TUI.float is Omarchy's own built-in app-id for ad-hoc floating TUI
+  // windows (see /usr/share/omarchy/default/hypr/apps/system.lua: tagged
+  // +floating-window, which carries float/center/size 875x600) — reusing it
+  // means this needs no window rule of its own. omarchy-launch-terminal (the
+  // portable, any-terminal way to spawn one) has no way to pass a class
+  // through, so this launches Alacritty directly, matching this system's
+  // actual configured default terminal.
   function openTerminalFor(id) {
-    Quickshell.execDetached(["omarchy-launch-terminal", "claude", "attach", id])
+    Quickshell.execDetached(["alacritty", "--class", "TUI.float", "-e", "claude", "attach", id])
   }
 
   function startMember(name) { runAction(["session", "start", name]) }
