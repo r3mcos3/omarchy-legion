@@ -13,7 +13,7 @@ die() {
 
 usage_error() {
   die 2 'usage: legionctl roster --json | cron-jobs --json | usage --json |
-  notifications --json [--limit N] |
+  notifications --json [--limit N] | notifications check | notifications mark-seen |
   tasks list --json | tasks add MEMBER TITLE | tasks send ID [MESSAGE] | tasks done ID |
   members add NAME CWD |
   session start|stop|restart NAME'
@@ -179,29 +179,189 @@ cmd_notifications() {
   read_json_or "$log_path" '[]' | jq --argjson n "$limit" '.[-$n:]'
 }
 
+# --- reply detection ---------------------------------------------------------
+#
+# Standalone equivalent of the webapp's advanceTasksOnReply: when a member
+# reports back to boss via SendMessage, that reply lands as a perfectly
+# ordinary entry in BOSS's OWN transcript (~/.claude/projects/<cwd>/<sessionId>
+# .jsonl) — either a plain `type:"user"` text block wrapping a
+# <cross-session-message from-name="X">...</cross-session-message> tag (the
+# common case, confirmed against this repo's own transcripts), or a
+# structured `type:"attachment"` entry whose attachment.origin.kind is
+# "peer" (a newer delivery path server.js also watches for). Polling THIS
+# ONE transcript for either shape removes the plugin's last functional
+# dependency on the webapp actually running — tasks.json's status now
+# advances on its own.
+projects_dir=$HOME/.claude/projects
+
+# Mirrors server.js's projectDirFor + findTranscriptPath: the project
+# directory encodes cwd by replacing "/" with "-"; prefer the session's own
+# transcript file, else fall back to the most recently modified .jsonl in
+# that directory (a just-(re)started or --continue'd session may not have
+# written its own file yet).
+find_transcript_path() {
+  local cwd=$1 session_id=$2
+  local dir="$projects_dir/$(printf '%s' "$cwd" | tr '/' '-')"
+  local direct="$dir/$session_id.jsonl"
+  if [[ -f $direct ]]; then
+    printf '%s' "$direct"
+    return 0
+  fi
+  [[ -d $dir ]] || return 1
+  find "$dir" -maxdepth 1 -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn | head -1 | cut -d' ' -f2-
+}
+
+# Reads new complete lines since $2 (byte offset), extracts peer replies,
+# and prints {newOffset, replies:[{from,text}]}. A NUL-safe, binary-aware
+# read (not `tail -c`/`dd` chained through bash) because JSONL transcript
+# content is arbitrary text; only ever processes up to the last full
+# newline so a line still being written is picked up whole on the next
+# poll, never parsed half-written.
+scan_transcript_replies() {
+  python3 -I -c '
+import json, re, sys
+
+path, offset = sys.argv[1], int(sys.argv[2])
+CROSS_SESSION_RE = re.compile(
+    r"<cross-session-message[^>]*from-name=\"([^\"]+)\"[^>]*>(.*?)</cross-session-message>",
+    re.DOTALL,
+)
+
+with open(path, "rb") as f:
+    f.seek(offset)
+    chunk = f.read()
+
+last_nl = chunk.rfind(b"\n")
+if last_nl == -1:
+    print(json.dumps({"newOffset": offset, "replies": []}))
+    sys.exit(0)
+
+usable = chunk[:last_nl]
+new_offset = offset + last_nl + 1
+replies = []
+for raw_line in usable.split(b"\n"):
+    raw_line = raw_line.strip()
+    if not raw_line:
+        continue
+    try:
+        entry = json.loads(raw_line)
+    except Exception:
+        continue
+    if entry.get("type") == "user":
+        content = (entry.get("message") or {}).get("content")
+        if isinstance(content, str):
+            m = CROSS_SESSION_RE.search(content)
+            if m:
+                replies.append({"from": m.group(1), "text": m.group(2).strip()})
+    elif entry.get("type") == "attachment":
+        origin = ((entry.get("attachment") or {}).get("origin")) or {}
+        if origin.get("kind") == "peer":
+            replies.append({"from": origin.get("name", ""), "text": (origin.get("body") or "").strip()})
+
+print(json.dumps({"newOffset": new_offset, "replies": replies}))
+' "$1" "$2"
+}
+
+# Advances the oldest in_progress task for each replying member to
+# approved_questions, filling .reply — same selection rule as
+# advanceTasksOnReply (oldest by sentAt; a member works one task at a time).
+apply_reply() {
+  local from=$1 text=$2 tasks ts
+  ts=$(date +%s%3N)
+  tasks=$(load_tasks)
+  tasks=$(jq --arg from "$from" --arg text "$text" --argjson ts "$ts" '
+    (
+      [.[] | select(.member == $from and .status == "in_progress")]
+      | sort_by(.sentAt // 0)
+      | .[0].id
+    ) as $targetId
+    | if $targetId == null then .
+      else map(if .id == $targetId then
+          .status = "approved_questions" | .reply = {text: $text, at: $ts}
+        else . end)
+      end
+  ' <<<"$tasks")
+  save_tasks "$tasks"
+}
+
+cmd_poll_replies() {
+  local marker transcript_marker prev_path prev_offset boss_session_id boss_cwd path offset scan new_offset replies count
+
+  marker=$(read_marker)
+  transcript_marker=$(jq -c '.transcript // {"path":"","offset":0}' <<<"$marker")
+  prev_path=$(jq -r '.path' <<<"$transcript_marker")
+  prev_offset=$(jq -r '.offset' <<<"$transcript_marker")
+
+  # .sessionId (the transcript-filename UUID), NOT .id (the short
+  # background-job id claude agents/stop use) -- these are two different
+  # identifiers server.js is also careful to keep apart.
+  boss_session_id=$(run_agents_json | jq -r '.[] | select(.name == "boss") | .sessionId')
+  boss_cwd=${workspaces[boss]}
+  if [[ -z $boss_session_id || $boss_session_id == null ]]; then
+    return 0 # boss offline — nothing to poll right now, try again next tick
+  fi
+
+  path=$(find_transcript_path "$boss_cwd" "$boss_session_id") || path=""
+  if [[ -z $path || ! -f $path ]]; then
+    return 0
+  fi
+
+  if [[ $path != "$prev_path" ]]; then
+    # New (or first-ever) transcript file: seed at EOF, same as the
+    # webapp's own pollTranscriptDelta — never backfill years of history as
+    # "new" the first time this sees a session.
+    offset=$(stat -c %s -- "$path")
+    marker=$(jq --arg p "$path" --argjson o "$offset" '.transcript = {path:$p, offset:$o}' <<<"$marker")
+    printf '%s' "$marker" > "$notify_marker_path"
+    return 0
+  fi
+
+  scan=$(scan_transcript_replies "$path" "$prev_offset")
+  new_offset=$(jq -r '.newOffset' <<<"$scan")
+  replies=$(jq -c '.replies' <<<"$scan")
+
+  count=$(jq 'length' <<<"$replies")
+  local i=0
+  while (( i < count )); do
+    local from text
+    from=$(jq -r --argjson i "$i" '.[$i].from' <<<"$replies")
+    text=$(jq -r --argjson i "$i" '.[$i].text' <<<"$replies")
+    [[ -n $from ]] && apply_reply "$from" "$text"
+    i=$((i + 1))
+  done
+
+  marker=$(jq --arg p "$path" --argjson o "$new_offset" '.transcript = {path:$p, offset:$o}' <<<"$marker")
+  printf '%s' "$marker" > "$notify_marker_path"
+}
+
 # --- notify-check ------------------------------------------------------------
 #
-# What "done with your task" actually looks like in the shared state: the
-# webapp's own advanceTasksOnReply (triggered by its transcript poll, which
-# this plugin does NOT reimplement) flips a task's status from in_progress
-# to approved_questions the moment that member's reply lands, filling in
-# .reply. Marking a task done by hand is the other terminal transition.
-# There is no on-disk trace of the webapp's other, purely in-memory
-# "sound/browser-notification" signal (flushPendingNotify / pendingNotify) —
-# it's broadcast live over its own websocket to connected browser tabs and
-# never written anywhere, so it isn't something a file-polling plugin like
-# this one can observe after the fact. Tracking task-status transitions
-# instead is both fully file-based and a closer match for what was actually
-# asked: a notification when a task you sent is done, not every intermediate
-# peer message.
+# advanceTasksOnReply's standalone equivalent (cmd_poll_replies above,
+# called first thing below) flips a task's status from in_progress to
+# approved_questions the moment that member's reply lands in boss's own
+# transcript, filling in .reply. Marking a task done by hand is the other
+# terminal transition. There is no on-disk trace of the webapp's other,
+# purely in-memory "sound/browser-notification" signal (flushPendingNotify /
+# pendingNotify) — it's broadcast live over its own websocket to connected
+# browser tabs and never written anywhere, so it isn't something a
+# file-polling plugin like this one can observe after the fact. Tracking
+# task-status transitions instead is both fully file-based and a closer
+# match for what was actually asked: a notification when a task you sent is
+# done, not every intermediate peer message.
 notify_marker_path=$HOME/.config/omarchy/legion-notify-marker.json
 
 read_marker() {
-  read_json_or "$notify_marker_path" '{"lastSeenTs":0,"taskStatuses":{}}'
+  read_json_or "$notify_marker_path" '{"lastSeenTs":0,"taskStatuses":{},"transcript":{"path":"","offset":0}}'
 }
 
 cmd_notifications_check() {
   local marker last_seen prev_statuses tasks transitions count
+
+  # Standalone reply detection first: this is what actually produces the
+  # in_progress -> approved_questions transitions below now, independently
+  # of whether the webapp is running.
+  cmd_poll_replies
 
   marker=$(read_marker)
   last_seen=$(jq -r '.lastSeenTs // 0' <<<"$marker")
@@ -210,9 +370,9 @@ cmd_notifications_check() {
   tasks=$(load_tasks)
 
   # One-shot: tasks that moved OUT of in_progress since the LAST check call
-  # (either auto-advanced to approved_questions by the webapp's reply
-  # detection, or marked done by hand from either UI) — fires exactly one
-  # desktop notification per transition, never repeats for the same one.
+  # (auto-advanced to approved_questions by cmd_poll_replies just above, or
+  # marked done by hand from either UI) — fires exactly one desktop
+  # notification per transition, never repeats for the same one.
   transitions=$(jq --argjson prev "$prev_statuses" '
     [.[] | select(($prev[.id] // "") == "in_progress" and .status != "in_progress")]
   ' <<<"$tasks")
@@ -238,11 +398,13 @@ cmd_notifications_check() {
 
   # Persist (not just changed ones, so a task that goes in_progress again
   # later — a follow-up message — is correctly seen as "was in_progress" on
-  # its next transition too).
+  # its next transition too). Merges into the CURRENT on-disk marker rather
+  # than rebuilding from scratch, so this doesn't clobber the .transcript
+  # offset cmd_poll_replies just wrote above.
   local new_statuses
   new_statuses=$(jq '[.[] | {key: .id, value: .status}] | from_entries' <<<"$tasks")
-  jq -n --argjson ts "$last_seen" --argjson statuses "$new_statuses" \
-    '{lastSeenTs:$ts, taskStatuses:$statuses}' > "$notify_marker_path"
+  jq --argjson ts "$last_seen" --argjson statuses "$new_statuses" \
+    '.lastSeenTs = $ts | .taskStatuses = $statuses' <<<"$(read_marker)" > "$notify_marker_path"
 
   # Ongoing, not a delta: which members have a resolved task (reply landed,
   # or marked done) still unacknowledged since lastSeenTs. This is what
