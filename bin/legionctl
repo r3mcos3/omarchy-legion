@@ -227,19 +227,34 @@ find_transcript_path() {
 }
 
 # Reads new complete lines since $2 (byte offset) and prints
-# {newOffset, messages:[{kind, peer, from, text}]} — kind is "user" (a
-# prompt landing on this session, by hand or via cross-session-message) or
-# "assistant" (that session's own text answer); peer/from are set only for
-# a recognized cross-session-message or peer-origin attachment. A NUL-safe,
-# binary-aware read (not `tail -c`/`dd` chained through bash) because JSONL
-# transcript content is arbitrary text; only ever processes up to the last
-# full newline so a line still being written is picked up whole on the next
-# poll, never parsed half-written.
+# {newOffset, messages:[{kind, peer, from, text}], pending}. kind is "user"
+# (a prompt landing on this session, by hand or via cross-session-message)
+# or "assistant" (a *confirmed-final* text answer — see below); peer/from
+# are set only for a recognized cross-session-message or peer-origin
+# attachment.
+#
+# A turn's assistant text-block-only messages and its tool-call messages
+# are never mixed in the same transcript entry here — a status update like
+# "checking the file now" and the tool call it precedes are always two
+# separate entries — so text presence alone can't tell an intermediate
+# one-liner apart from the actual final answer. What can: whether another
+# assistant entry (i.e. a tool call, since that's the only thing that
+# follows a mid-turn update) comes after it before the turn hands back to
+# a real user/peer entry. $3 carries the still-unconfirmed candidate text
+# from the previous poll (or "") so this holds across polls; a still-
+# unconfirmed candidate at the end of THIS batch is returned as `pending`
+# for the next poll to keep tracking, not fired yet. A tool-result-only
+# user entry doesn't confirm anything — the agentic loop just continues.
+#
+# A NUL-safe, binary-aware read (not `tail -c`/`dd` chained through bash)
+# because JSONL transcript content is arbitrary text; only ever processes
+# up to the last full newline so a line still being written is picked up
+# whole on the next poll, never parsed half-written.
 scan_transcript_messages() {
   python3 -I -c '
 import json, re, sys
 
-path, offset = sys.argv[1], int(sys.argv[2])
+path, offset, pending = sys.argv[1], int(sys.argv[2]), (sys.argv[3] or None)
 CROSS_SESSION_RE = re.compile(
     r"<cross-session-message[^>]*from-name=\"([^\"]+)\"[^>]*>(.*?)</cross-session-message>",
     re.DOTALL,
@@ -251,7 +266,7 @@ with open(path, "rb") as f:
 
 last_nl = chunk.rfind(b"\n")
 if last_nl == -1:
-    print(json.dumps({"newOffset": offset, "messages": []}))
+    print(json.dumps({"newOffset": offset, "messages": [], "pending": pending}))
     sys.exit(0)
 
 usable = chunk[:last_nl]
@@ -269,6 +284,12 @@ def text_blocks(content):
                 out.append(t)
     return out
 
+def confirm_pending():
+    global pending
+    if pending:
+        messages.append({"kind": "assistant", "peer": False, "from": None, "text": pending})
+    pending = None
+
 for raw_line in usable.split(b"\n"):
     raw_line = raw_line.strip()
     if not raw_line:
@@ -282,6 +303,9 @@ for raw_line in usable.split(b"\n"):
     if etype == "user":
         content = (entry.get("message") or {}).get("content")
         candidates = [content] if isinstance(content, str) else text_blocks(content)
+        if not candidates:
+            continue  # tool-result-only feedback — loop continues, not a turn boundary
+        confirm_pending()
         for t in candidates:
             m = CROSS_SESSION_RE.search(t)
             if m:
@@ -293,15 +317,18 @@ for raw_line in usable.split(b"\n"):
     elif etype == "attachment":
         origin = ((entry.get("attachment") or {}).get("origin")) or {}
         if origin.get("kind") == "peer":
+            confirm_pending()
             messages.append({"kind": "user", "peer": True, "from": origin.get("name", ""), "text": (origin.get("body") or "").strip()})
     elif etype == "assistant":
         content = (entry.get("message") or {}).get("content")
         texts = text_blocks(content)
         if texts:
-            messages.append({"kind": "assistant", "peer": False, "from": None, "text": " ".join(texts)})
+            pending = " ".join(texts)  # new unconfirmed candidate, supersedes any older one
+        elif any(isinstance(b, dict) and b.get("type") == "tool_use" for b in (content or [])):
+            pending = None  # a tool call followed — whatever was pending is proven non-final
 
-print(json.dumps({"newOffset": new_offset, "messages": messages}))
-' "$1" "$2"
+print(json.dumps({"newOffset": new_offset, "messages": messages, "pending": pending}))
+' "$1" "$2" "$3"
 }
 
 # Advances the oldest in_progress task for each replying member to
@@ -362,6 +389,15 @@ notify_generic_message() {
 # messages, advances tasks on a boss-side peer reply (job 1 above), and
 # fires a generic notification + blink for everything else (job 2), gated
 # on that member's terminal not currently being focused.
+#
+# Job 2 fires for an incoming "vraag" (a kind:user message landing on that
+# session) as soon as it arrives, and for a kind:assistant message only
+# once scan_transcript_messages has CONFIRMED it was the turn's actual
+# final answer, not one of the intermediate one-line status updates a busy
+# turn can emit along the way (see that function's own comment for how).
+# The still-unconfirmed candidate carries over between polls via
+# .pendingAnswers[name] — passed back in as scan_transcript_messages's 3rd
+# argument each time, and written back from its `pending` result below.
 cmd_poll_all() {
   local marker roster names name
 
@@ -390,16 +426,19 @@ cmd_poll_all() {
     if [[ $path != "$prev_path" ]]; then
       # New (or first-ever) transcript file for this session: seed at EOF,
       # same as the webapp's own pollTranscriptDelta — never backfill years
-      # of history as "new" the first time this sees a session.
+      # of history as "new" the first time this sees a session. Also drops
+      # any pending candidate from the old file, which can never resolve now.
       offset=$(stat -c %s -- "$path")
       marker=$(jq --arg n "$name" --arg p "$path" --argjson o "$offset" \
-        '.transcripts[$n] = {path:$p, offset:$o}' <<<"$marker")
+        '.transcripts[$n] = {path:$p, offset:$o} | del(.pendingAnswers[$n])' <<<"$marker")
       continue
     fi
 
-    local scan new_offset msgs count i=0
-    scan=$(scan_transcript_messages "$path" "$prev_offset")
+    local prev_pending scan new_offset new_pending msgs count i=0
+    prev_pending=$(jq -r --arg n "$name" '.pendingAnswers[$n] // ""' <<<"$marker")
+    scan=$(scan_transcript_messages "$path" "$prev_offset" "$prev_pending")
     new_offset=$(jq -r '.newOffset' <<<"$scan")
+    new_pending=$(jq -r '.pending // ""' <<<"$scan")
     msgs=$(jq -c '.messages' <<<"$scan")
     count=$(jq 'length' <<<"$msgs")
 
@@ -421,6 +460,11 @@ cmd_poll_all() {
       i=$((i + 1))
     done
 
+    if [[ -n $new_pending ]]; then
+      marker=$(jq --arg n "$name" --arg t "$new_pending" '.pendingAnswers[$n] = $t' <<<"$marker")
+    else
+      marker=$(jq --arg n "$name" 'del(.pendingAnswers[$n])' <<<"$marker")
+    fi
     marker=$(jq --arg n "$name" --arg p "$path" --argjson o "$new_offset" \
       '.transcripts[$n] = {path:$p, offset:$o}' <<<"$marker")
   done <<<"$names"
@@ -442,7 +486,7 @@ cmd_poll_all() {
 notify_marker_path=$HOME/.config/omarchy/legion-notify-marker.json
 
 read_marker() {
-  read_json_or "$notify_marker_path" '{"lastSeenTs":0,"taskStatuses":{},"transcripts":{},"unseen":[]}'
+  read_json_or "$notify_marker_path" '{"lastSeenTs":0,"taskStatuses":{},"transcripts":{},"unseen":[],"pendingAnswers":{}}'
 }
 
 notification_sound_path=/usr/share/sounds/freedesktop/stereo/complete.oga

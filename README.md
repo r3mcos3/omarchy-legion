@@ -77,17 +77,28 @@ Finding one advances the oldest `in_progress` task for that member to
 `approved_questions` and fills in `.reply` — same rule as the webapp (a
 member works one task at a time).
 
-**2. General "vraag of antwoord" notifications.** Every OTHER new message in
-every session's own transcript — a `type:"user"` entry (a prompt someone
-typed at that member, or a cross-session message addressed to it) or a
-`type:"assistant"` entry with a text block (that member's own answer) —
-fires a desktop notification, plays a chime, and marks that member `unseen`
-(the blink), unless its terminal window currently has focus (see below).
-This is deliberately broad: a chatty session notifies a lot. Boss's own
-peer-origin replies are excluded here specifically because job 1 above
-already gives them a nicer, task-specific notification — everything else,
-including boss's own plain assistant text (e.g. its final answer to you in
-chat), goes through this path.
+**2. "Vraag of antwoord" notifications — a question landing on a member, or
+its actual final answer.** A `type:"user"` entry (a prompt someone typed at
+that member, or a cross-session message addressed to it) fires immediately.
+A `type:"assistant"` text entry is trickier: a single turn can emit several
+of those — short "doing X now" updates alongside tool calls — before the
+real final answer, and only that last one is worth a notification. Text and
+a tool call are never in the same transcript entry here, so text presence
+alone can't tell them apart; what can is whether another assistant entry
+(necessarily a tool call, since that's the only thing that follows a
+mid-turn update) comes next, or the turn instead hands back to a real
+user/peer entry. So an assistant text candidate is held (`.pendingAnswers`
+in the marker, carried across polls) and only turned into a notification
+once a later poll confirms — a genuine next turn started — that it was
+never followed by more tool activity; a tool call arriving instead just
+discards it, no notification. A tool-result-only `user` entry (the
+mechanical feedback loop, not a real turn) confirms nothing either way.
+Either kind fires a desktop notification, plays a chime, and marks that
+member `unseen` (the blink), unless its terminal window currently has
+focus (see below). Boss's own peer-origin replies are excluded here
+specifically because job 1 above already gives them a nicer, task-specific
+notification — everything else, including boss's own final answer to you
+in chat, goes through this path.
 
 ### Focus check
 
