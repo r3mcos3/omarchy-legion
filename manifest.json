@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "r3mcos3.legion",
+  "name": "Legion",
+  "version": "0.1.0",
+  "author": "r3mcos3",
+  "license": "MIT",
+  "description": "Native bar panel for the claude-legion coordinator: roster, tasks, cron jobs, notifications, and usage — for personal use alongside the existing dashboard webapp.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Legion",
+    "description": "Claude legion roster, tasks, and notifications",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

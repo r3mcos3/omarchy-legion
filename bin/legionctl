@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+
+program=${0##*/}
+
+die() {
+  local code=$1
+  shift
+  printf '%s: %s\n' "$program" "$*" >&2
+  exit "$code"
+}
+
+usage_error() {
+  die 2 'usage: legionctl roster --json | cron-jobs --json | usage --json |
+  notifications --json [--limit N] |
+  tasks list --json | tasks add MEMBER TITLE | tasks send ID [MESSAGE] | tasks done ID |
+  members add NAME CWD |
+  session start|stop|restart NAME'
+}
+
+# This is a personal-use companion to the claude-legion dashboard webapp
+# (which keeps running independently) — NOT a hardened, publicly-distributed
+# tool like bin/aliasctl in the zsh-alias-manager repo. It deliberately shares
+# members.json/tasks.json/log-history.json/cron-jobs.json with the webapp
+# (both read AND write them) rather than inventing a second source of truth,
+# so either UI reflects the other's changes. That means a read-modify-write
+# from here can theoretically race a concurrent write from the webapp's own
+# Node process; for how rarely either side actually writes (a manual click),
+# that residual risk is accepted rather than engineered around.
+
+legion_root=$HOME/claude-legion
+dashboard_dir=$legion_root/dashboard
+members_path=$dashboard_dir/members.json
+tasks_path=$dashboard_dir/tasks.json
+log_path=$dashboard_dir/log-history.json
+cron_jobs_path=$legion_root/cron-jobs.json
+usage_cache_path=$HOME/.claude/usage-cache.json
+
+fixed_names=(hours favs fantasy fpl home)
+declare -A workspaces=(
+  [hours]="$HOME/Documents/github/hours"
+  [favs]="$HOME/Documents/github/favs"
+  [fantasy]="$HOME/Documents/github/fantasy-league-26-27"
+  [fpl]="$HOME/Documents/github/fpl-tracker-26-27"
+  [home]="$HOME/homeassistant"
+  [boss]="$legion_root"
+)
+
+name_re='^[a-z][a-z0-9-]{0,23}$'
+
+# --- shared helpers ----------------------------------------------------------
+
+read_json_or() {
+  local path=$1 fallback=$2
+  if [[ -f $path ]]; then
+    local content
+    content=$(cat -- "$path")
+    if jq -e . >/dev/null 2>&1 <<<"$content"; then
+      printf '%s' "$content"
+      return 0
+    fi
+  fi
+  printf '%s' "$fallback"
+}
+
+# Node's own boot skips to the first '[' to tolerate a version-manager
+# banner line ahead of the JSON (see server.js's runClaudeAgentsJSON) —
+# same tolerance here.
+run_agents_json() {
+  local raw sliced
+  raw=$(claude agents --json 2>/dev/null || true)
+  sliced=$(printf '%s\n' "$raw" | sed -n '/^\[/,$p')
+  if [[ -n $sliced ]] && jq -e . >/dev/null 2>&1 <<<"$sliced"; then
+    printf '%s' "$sliced"
+  else
+    printf '[]'
+  fi
+}
+
+dynamic_members_json() {
+  read_json_or "$members_path" '[]'
+}
+
+known_names_json() {
+  local fixed_json members_json
+  fixed_json=$(printf '%s\n' "${fixed_names[@]}" boss | jq -R . | jq -s .)
+  members_json=$(dynamic_members_json | jq '[.[].name]')
+  jq -n --argjson a "$fixed_json" --argjson b "$members_json" '$a + $b'
+}
+
+is_known_name() {
+  local name=$1
+  known_names_json | jq -e --arg n "$name" 'index($n) != null' >/dev/null
+}
+
+workspace_for() {
+  local name=$1
+  if [[ -n ${workspaces[$name]+x} ]]; then
+    printf '%s' "${workspaces[$name]}"
+    return 0
+  fi
+  dynamic_members_json | jq -r --arg n "$name" '.[] | select(.name == $n) | .cwd' | head -1
+}
+
+# --- roster ------------------------------------------------------------------
+
+cmd_roster() {
+  local agents_json members_json fixed_json workspaces_json
+  agents_json=$(run_agents_json)
+  members_json=$(dynamic_members_json)
+  fixed_json=$(printf '%s\n' "${fixed_names[@]}" | jq -R . | jq -s .)
+  workspaces_json=$(jq -n \
+    --arg hours "${workspaces[hours]}" --arg favs "${workspaces[favs]}" \
+    --arg fantasy "${workspaces[fantasy]}" --arg fpl "${workspaces[fpl]}" \
+    --arg home "${workspaces[home]}" --arg boss "${workspaces[boss]}" \
+    '{hours:$hours, favs:$favs, fantasy:$fantasy, fpl:$fpl, home:$home, boss:$boss}')
+
+  jq -n \
+    --argjson agents "$agents_json" \
+    --argjson members "$members_json" \
+    --argjson fixed "$fixed_json" \
+    --argjson workspaces "$workspaces_json" \
+    '
+    (["boss"] + $fixed + ($members | map(.name))) as $order
+    | ($agents | map({key: .name, value: .}) | from_entries) as $byName
+    | ($members | map({key: .name, value: .cwd}) | from_entries) as $memberCwd
+    | [ $order[] as $name
+        | ($byName[$name]) as $a
+        | {
+            name: $name,
+            isFixed: ($fixed | index($name) != null),
+            isBoss: ($name == "boss"),
+            online: ($a != null),
+            id: ($a.id // null),
+            cwd: ($a.cwd // $workspaces[$name] // $memberCwd[$name] // null),
+            status: ($a.status // null),
+            state: ($a.state // null)
+          }
+      ]
+    '
+}
+
+# --- cron jobs -----------------------------------------------------------
+
+cmd_cron_jobs() {
+  read_json_or "$cron_jobs_path" '[]'
+}
+
+# --- usage -----------------------------------------------------------------
+
+cmd_usage() {
+  local data
+  data=$(read_json_or "$usage_cache_path" 'null')
+  if [[ $data == null ]]; then
+    printf '%s' 'null'
+    return 0
+  fi
+  if jq -e '(.fiveHour | type) == "number" and (.sevenDay | type) == "number"' >/dev/null 2>&1 <<<"$data"; then
+    printf '%s' "$data"
+  else
+    printf '%s' 'null'
+  fi
+}
+
+# --- notifications -----------------------------------------------------------
+
+cmd_notifications() {
+  local limit=40
+  while (($#)); do
+    case $1 in
+      --limit)
+        limit=$2
+        shift 2
+        ;;
+      *) usage_error ;;
+    esac
+  done
+  read_json_or "$log_path" '[]' | jq --argjson n "$limit" '.[-$n:]'
+}
+
+# --- tasks -------------------------------------------------------------------
+
+load_tasks() {
+  read_json_or "$tasks_path" '[]'
+}
+
+save_tasks() {
+  local content=$1
+  printf '%s' "$content" > "$tasks_path"
+}
+
+cmd_tasks_list() {
+  load_tasks
+}
+
+cmd_tasks_add() {
+  local member=$1 title=$2 message=${LEGION_MESSAGE:-}
+  [[ -n $message ]] || die 2 'message required (pass via LEGION_MESSAGE env)'
+  is_known_name "$member" || die 2 "unknown member: $member"
+  [[ -n $title ]] || die 2 'title required'
+
+  local id ts new_task tasks
+  id=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+  ts=$(date +%s%3N)
+  new_task=$(jq -n --arg id "$id" --arg title "$title" --arg message "$message" \
+    --arg member "$member" --argjson ts "$ts" \
+    '{id:$id, title:$title, message:$message, member:$member, status:"backlog",
+      createdAt:$ts, sentAt:null, reply:null, doneAt:null, delivered:false}')
+  tasks=$(load_tasks | jq --argjson t "$new_task" '. + [$t]')
+  save_tasks "$tasks"
+  jq -n --argjson t "$new_task" '{ok:true, task:$t}'
+}
+
+# Drives a real pty attached to `claude attach ID`, types the message, presses
+# Enter, then detaches — the same mechanism the webapp's own "Terminal" tab
+# and its sendTextToSession() use (see server.js), just via python3's stdlib
+# pty module here instead of node-pty. Detaching does not stop the session.
+pty_send() {
+  local agent_id=$1 text=$2
+  python3 -I -c '
+import os, pty, signal, sys, time
+
+agent_id = sys.argv[1]
+text = sys.argv[2]
+
+pid, fd = pty.fork()
+if pid == 0:
+    try:
+        os.execvp("claude", ["claude", "attach", agent_id])
+    finally:
+        os._exit(127)
+
+try:
+    time.sleep(0.5)
+    os.write(fd, text.encode())
+    time.sleep(0.2)
+    os.write(fd, b"\r")
+    time.sleep(0.7)
+finally:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+' "$agent_id" "$text"
+}
+
+cmd_tasks_send() {
+  local id=$1 followup=${2:-}
+  local tasks task member text agent_id ts
+
+  tasks=$(load_tasks)
+  task=$(jq --arg id "$id" '.[] | select(.id == $id)' <<<"$tasks")
+  [[ -n $task ]] || die 3 "unknown task: $id"
+  [[ $(jq -r '.status' <<<"$task") != done ]] || die 2 'task is already done'
+
+  member=$(jq -r '.member' <<<"$task")
+  text=$followup
+  [[ -n $text ]] || text=$(jq -r '.message' <<<"$task")
+  text=${text//$'\n'/ }
+  text=${text//$'\r'/ }
+  text=${text//$'\t'/ }
+
+  agent_id=$(run_agents_json | jq -r --arg m "$member" '.[] | select(.name == $m) | .id')
+  [[ -n $agent_id && $agent_id != null ]] || die 1 "$member is offline"
+
+  pty_send "$agent_id" "$text"
+
+  ts=$(date +%s%3N)
+  tasks=$(jq --arg id "$id" --arg text "$text" --argjson ts "$ts" '
+    map(if .id == $id then
+      (if $text != .message then .message = $text else . end)
+      | .status = "in_progress" | .sentAt = $ts | .reply = null | .delivered = true
+    else . end)
+  ' <<<"$tasks")
+  save_tasks "$tasks"
+  jq --arg id "$id" '.[] | select(.id == $id) | {ok:true, task:.}' <<<"$tasks"
+}
+
+cmd_tasks_done() {
+  local id=$1 tasks ts
+  tasks=$(load_tasks)
+  jq -e --arg id "$id" 'any(.[]; .id == $id)' >/dev/null <<<"$tasks" || die 3 "unknown task: $id"
+  ts=$(date +%s%3N)
+  tasks=$(jq --arg id "$id" --argjson ts "$ts" '
+    map(if .id == $id then .status = "done" | .doneAt = $ts else . end)
+  ' <<<"$tasks")
+  save_tasks "$tasks"
+  jq --arg id "$id" '.[] | select(.id == $id) | {ok:true, task:.}' <<<"$tasks"
+}
+
+# --- members -----------------------------------------------------------------
+
+cmd_members_add() {
+  local name=$1 cwd=$2
+  [[ $name =~ $name_re ]] || die 2 'invalid name (lowercase/digits/dashes, starting with a letter)'
+  ! is_known_name "$name" || die 2 'name already exists'
+  [[ $cwd == /* ]] || die 2 'cwd must be an absolute path'
+
+  mkdir -p -- "$cwd" || die 1 "could not create $cwd"
+
+  local settings_dir=$cwd/.claude settings_path
+  settings_path=$settings_dir/settings.json
+  mkdir -p -- "$settings_dir"
+  local settings='{}'
+  if [[ -f $settings_path ]]; then
+    settings=$(cat -- "$settings_path")
+    jq -e . >/dev/null 2>&1 <<<"$settings" || { echo "warning: $settings_path is not valid JSON, leaving it alone" >&2; settings=''; }
+  fi
+  if [[ -n $settings ]]; then
+    settings=$(jq '.worktree = ((.worktree // {}) + {bgIsolation: "none"})' <<<"$settings")
+    printf '%s\n' "$settings" > "$settings_path"
+  fi
+
+  local members added_at
+  added_at=$(date +%s%3N)
+  members=$(dynamic_members_json | jq --arg name "$name" --arg cwd "$cwd" --argjson at "$added_at" \
+    '. + [{name:$name, cwd:$cwd, addedAt:$at}]')
+  printf '%s\n' "$members" > "$members_path"
+
+  cmd_session_start "$name"
+  jq -n --arg name "$name" --arg cwd "$cwd" '{ok:true, name:$name, cwd:$cwd}'
+}
+
+# --- session control -----------------------------------------------------------
+
+cmd_session_start() {
+  local name=$1
+  is_known_name "$name" || die 2 "unknown session: $name"
+  local already
+  already=$(run_agents_json | jq -e --arg n "$name" 'any(.[]; .name == $n)' 2>/dev/null || echo false)
+  if [[ $already == true ]]; then
+    jq -n '{ok:true, note:"already running"}'
+    return 0
+  fi
+  local cwd
+  cwd=$(workspace_for "$name")
+  [[ -n $cwd && -d $cwd ]] || die 1 "workspace not found for $name"
+  ( cd "$cwd" && setsid claude --background --name "$name" --dangerously-skip-permissions >/dev/null 2>&1 & )
+  jq -n '{ok:true}'
+}
+
+cmd_session_stop() {
+  local name=$1
+  is_known_name "$name" || die 2 "unknown session: $name"
+  local agent_id
+  agent_id=$(run_agents_json | jq -r --arg n "$name" '.[] | select(.name == $n) | .id')
+  [[ -n $agent_id && $agent_id != null ]] || die 1 "$name is not running"
+  claude stop "$agent_id" >/dev/null 2>&1 || die 1 'stop failed'
+  jq -n '{ok:true}'
+}
+
+cmd_session_restart() {
+  local name=$1
+  cmd_session_stop "$name" || true
+  sleep 1.2
+  cmd_session_start "$name"
+}
+
+# --- dispatch ------------------------------------------------------------------
+
+command_name=${1:-}
+case $command_name in
+  roster)
+    (($# == 2)) && [[ $2 == --json ]] || usage_error
+    cmd_roster
+    ;;
+  cron-jobs)
+    (($# == 2)) && [[ $2 == --json ]] || usage_error
+    cmd_cron_jobs
+    ;;
+  usage)
+    (($# == 2)) && [[ $2 == --json ]] || usage_error
+    cmd_usage
+    ;;
+  notifications)
+    shift
+    cmd_notifications "$@"
+    ;;
+  tasks)
+    subcommand=${2:-}
+    case $subcommand in
+      list)
+        (($# == 3)) && [[ $3 == --json ]] || usage_error
+        cmd_tasks_list
+        ;;
+      add)
+        (($# == 4)) || usage_error
+        cmd_tasks_add "$3" "$4"
+        ;;
+      send)
+        (($# == 3 || $# == 4)) || usage_error
+        cmd_tasks_send "$3" "${4:-}"
+        ;;
+      done)
+        (($# == 3)) || usage_error
+        cmd_tasks_done "$3"
+        ;;
+      *) usage_error ;;
+    esac
+    ;;
+  members)
+    subcommand=${2:-}
+    case $subcommand in
+      add)
+        (($# == 4)) || usage_error
+        cmd_members_add "$3" "$4"
+        ;;
+      *) usage_error ;;
+    esac
+    ;;
+  session)
+    subcommand=${2:-}
+    name=${3:-}
+    [[ -n $name ]] || usage_error
+    case $subcommand in
+      start) cmd_session_start "$name" ;;
+      stop) cmd_session_stop "$name" ;;
+      restart) cmd_session_restart "$name" ;;
+      *) usage_error ;;
+    esac
+    ;;
+  *)
+    usage_error
+    ;;
+esac
