@@ -165,10 +165,15 @@ Panel {
   // means this needs no window rule of its own. omarchy-launch-terminal (the
   // portable, any-terminal way to spawn one) has no way to pass a class
   // through, so this launches Alacritty directly, matching this system's
-  // actual configured default terminal.
-  function openTerminalFor(id) {
-    Quickshell.execDetached(["alacritty", "--class", "TUI.float", "-e", "claude", "attach", id])
+  // actual configured default terminal. --title "legion:<name>" is how
+  // legionctl's is_terminal_focused() tells one member's terminal apart from
+  // another's later — they all share the "TUI.float" class (needed for the
+  // floating rule above), so the title is the only per-member handle left.
+  function openTerminalFor(id, name) {
+    Quickshell.execDetached(["alacritty", "--class", "TUI.float", "--title", "legion:" + name, "-e", "claude", "attach", id])
   }
+
+  function startAll() { runAction(["start-all"]) }
 
   function startMember(name) { runAction(["session", "start", name]) }
   function stopMember(name) { runAction(["session", "stop", name]) }
@@ -383,11 +388,25 @@ Panel {
           PanelSeparator { width: parent.width; foreground: root.foreground }
 
           // --- roster ------------------------------------------------------
-          PanelSectionHeader {
+          Row {
             width: parent.width
-            text: "LEDEN"
-            foreground: root.foreground
-            fontFamily: root.fontFamily
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              text: "LEDEN"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+            Button {
+              text: "Start alles"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              horizontalPadding: Style.space(6)
+              verticalPadding: Style.space(2)
+              enabled: !root.actionBusy
+              onClicked: root.startAll()
+            }
           }
 
           Repeater {
@@ -683,7 +702,7 @@ Panel {
           fontSize: Style.font.caption
           horizontalPadding: Style.space(6)
           verticalPadding: Style.space(3)
-          onClicked: root.openTerminalFor(rosterRow.entry.id)
+          onClicked: root.openTerminalFor(rosterRow.entry.id, rosterRow.entry.name)
         }
         Button {
           visible: rosterRow.entry && !rosterRow.entry.online

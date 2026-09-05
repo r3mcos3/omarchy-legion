@@ -16,7 +16,8 @@ usage_error() {
   notifications --json [--limit N] | notifications check | notifications mark-seen |
   tasks list --json | tasks add MEMBER TITLE | tasks send ID [MESSAGE] | tasks done ID |
   members add NAME CWD |
-  session start|stop|restart NAME'
+  session start|stop|restart NAME |
+  start-all'
 }
 
 # This is a personal-use companion to the claude-legion dashboard webapp
@@ -179,19 +180,32 @@ cmd_notifications() {
   read_json_or "$log_path" '[]' | jq --argjson n "$limit" '.[-$n:]'
 }
 
-# --- reply detection ---------------------------------------------------------
+# --- message detection --------------------------------------------------------
 #
-# Standalone equivalent of the webapp's advanceTasksOnReply: when a member
-# reports back to boss via SendMessage, that reply lands as a perfectly
-# ordinary entry in BOSS's OWN transcript (~/.claude/projects/<cwd>/<sessionId>
-# .jsonl) — either a plain `type:"user"` text block wrapping a
-# <cross-session-message from-name="X">...</cross-session-message> tag (the
-# common case, confirmed against this repo's own transcripts), or a
-# structured `type:"attachment"` entry whose attachment.origin.kind is
-# "peer" (a newer delivery path server.js also watches for). Polling THIS
-# ONE transcript for either shape removes the plugin's last functional
-# dependency on the webapp actually running — tasks.json's status now
-# advances on its own.
+# Two jobs share one transcript-scanning pass, across EVERY known session
+# (boss + fixed + dynamic), not just boss:
+#
+# 1. Task-reply detection (standalone equivalent of the webapp's
+#    advanceTasksOnReply): when a member reports back to boss via
+#    SendMessage, that reply lands as a perfectly ordinary entry in BOSS's
+#    OWN transcript — either a plain `type:"user"` text block wrapping a
+#    <cross-session-message from-name="X">...</cross-session-message> tag,
+#    or a structured `type:"attachment"` entry whose attachment.origin.kind
+#    is "peer". Advances the matching in_progress task, same as before.
+#
+# 2. General "vraag of antwoord" notifications: ANY new message in ANY
+#    session's own transcript — a prompt landing on that member (typed by
+#    hand, or a cross-session message from boss), or that member's own
+#    assistant text answer — fires a desktop notification + blinks that
+#    member's row, unless its terminal window currently has focus. This is
+#    deliberately broad (every text turn, not just tracked tasks) per an
+#    explicit choice to favor completeness over quiet — a member that talks
+#    a lot will notify a lot.
+#
+# Boss's own peer-origin entries are only routed through job 1 (they already
+# get a nicer, task-specific notification via the transitions check below);
+# every other message — including boss's own plain assistant replies, which
+# is exactly what was missing before this — goes through job 2.
 projects_dir=$HOME/.claude/projects
 
 # Mirrors server.js's projectDirFor + findTranscriptPath: the project
@@ -212,13 +226,16 @@ find_transcript_path() {
     | sort -rn | head -1 | cut -d' ' -f2-
 }
 
-# Reads new complete lines since $2 (byte offset), extracts peer replies,
-# and prints {newOffset, replies:[{from,text}]}. A NUL-safe, binary-aware
-# read (not `tail -c`/`dd` chained through bash) because JSONL transcript
-# content is arbitrary text; only ever processes up to the last full
-# newline so a line still being written is picked up whole on the next
+# Reads new complete lines since $2 (byte offset) and prints
+# {newOffset, messages:[{kind, peer, from, text}]} — kind is "user" (a
+# prompt landing on this session, by hand or via cross-session-message) or
+# "assistant" (that session's own text answer); peer/from are set only for
+# a recognized cross-session-message or peer-origin attachment. A NUL-safe,
+# binary-aware read (not `tail -c`/`dd` chained through bash) because JSONL
+# transcript content is arbitrary text; only ever processes up to the last
+# full newline so a line still being written is picked up whole on the next
 # poll, never parsed half-written.
-scan_transcript_replies() {
+scan_transcript_messages() {
   python3 -I -c '
 import json, re, sys
 
@@ -234,12 +251,24 @@ with open(path, "rb") as f:
 
 last_nl = chunk.rfind(b"\n")
 if last_nl == -1:
-    print(json.dumps({"newOffset": offset, "replies": []}))
+    print(json.dumps({"newOffset": offset, "messages": []}))
     sys.exit(0)
 
 usable = chunk[:last_nl]
 new_offset = offset + last_nl + 1
-replies = []
+messages = []
+
+def text_blocks(content):
+    if not isinstance(content, list):
+        return []
+    out = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            t = (block.get("text") or "").strip()
+            if t:
+                out.append(t)
+    return out
+
 for raw_line in usable.split(b"\n"):
     raw_line = raw_line.strip()
     if not raw_line:
@@ -248,18 +277,30 @@ for raw_line in usable.split(b"\n"):
         entry = json.loads(raw_line)
     except Exception:
         continue
-    if entry.get("type") == "user":
+
+    etype = entry.get("type")
+    if etype == "user":
         content = (entry.get("message") or {}).get("content")
-        if isinstance(content, str):
-            m = CROSS_SESSION_RE.search(content)
+        candidates = [content] if isinstance(content, str) else text_blocks(content)
+        for t in candidates:
+            m = CROSS_SESSION_RE.search(t)
             if m:
-                replies.append({"from": m.group(1), "text": m.group(2).strip()})
-    elif entry.get("type") == "attachment":
+                messages.append({"kind": "user", "peer": True, "from": m.group(1), "text": m.group(2).strip()})
+            else:
+                t = t.strip()
+                if t:
+                    messages.append({"kind": "user", "peer": False, "from": None, "text": t})
+    elif etype == "attachment":
         origin = ((entry.get("attachment") or {}).get("origin")) or {}
         if origin.get("kind") == "peer":
-            replies.append({"from": origin.get("name", ""), "text": (origin.get("body") or "").strip()})
+            messages.append({"kind": "user", "peer": True, "from": origin.get("name", ""), "text": (origin.get("body") or "").strip()})
+    elif etype == "assistant":
+        content = (entry.get("message") or {}).get("content")
+        texts = text_blocks(content)
+        if texts:
+            messages.append({"kind": "assistant", "peer": False, "from": None, "text": " ".join(texts)})
 
-print(json.dumps({"newOffset": new_offset, "replies": replies}))
+print(json.dumps({"newOffset": new_offset, "messages": messages}))
 ' "$1" "$2"
 }
 
@@ -285,74 +326,123 @@ apply_reply() {
   save_tasks "$tasks"
 }
 
-cmd_poll_replies() {
-  local marker transcript_marker prev_path prev_offset boss_session_id boss_cwd path offset scan new_offset replies count
+# True (exit 0) only when the currently FOCUSED window is that member's own
+# terminal (opened with --title "legion:<name>", see Panel.qml's
+# openTerminalFor). Uses initialTitle, not the live title — a running
+# program (claude attach, the shell) can rewrite its own title afterward,
+# but initialTitle is captured once at window-map time and stays put, so it
+# can't be spoofed by whatever the child process does. Missing hyprctl or no
+# match both mean "not focused" — the safe default is to notify.
+is_terminal_focused() {
+  local name=$1 active_title
+  command -v hyprctl >/dev/null 2>&1 || return 1
+  active_title=$(hyprctl activewindow -j 2>/dev/null | jq -r '.initialTitle // empty' 2>/dev/null) || return 1
+  [[ $active_title == "legion:$name" ]]
+}
+
+notify_generic_message() {
+  local name=$1 kind=$2 text=$3 headline
+  text=${text//$'\n'/ }
+  if ((${#text} > 200)); then
+    text="${text:0:200}…"
+  fi
+  if [[ $kind == user ]]; then
+    headline="$name — nieuwe vraag"
+  else
+    headline="$name — antwoord"
+  fi
+  omarchy-notification-send --app-name legion -u normal \
+    "$headline" "$text" \
+    --exec omarchy-shell r3mcos3.legion toggle \
+    >/dev/null 2>&1 || true
+  play_notification_sound
+}
+
+# Polls every known session's OWN transcript (not just boss's) for new
+# messages, advances tasks on a boss-side peer reply (job 1 above), and
+# fires a generic notification + blink for everything else (job 2), gated
+# on that member's terminal not currently being focused.
+cmd_poll_all() {
+  local marker roster names name
 
   marker=$(read_marker)
-  transcript_marker=$(jq -c '.transcript // {"path":"","offset":0}' <<<"$marker")
-  prev_path=$(jq -r '.path' <<<"$transcript_marker")
-  prev_offset=$(jq -r '.offset' <<<"$transcript_marker")
+  roster=$(run_agents_json)
+  names=$(jq -r '.[].name' <<<"$roster")
 
-  # .sessionId (the transcript-filename UUID), NOT .id (the short
-  # background-job id claude agents/stop use) -- these are two different
-  # identifiers server.js is also careful to keep apart.
-  boss_session_id=$(run_agents_json | jq -r '.[] | select(.name == "boss") | .sessionId')
-  boss_cwd=${workspaces[boss]}
-  if [[ -z $boss_session_id || $boss_session_id == null ]]; then
-    return 0 # boss offline — nothing to poll right now, try again next tick
-  fi
+  while IFS= read -r name; do
+    [[ -n $name ]] || continue
 
-  path=$(find_transcript_path "$boss_cwd" "$boss_session_id") || path=""
-  if [[ -z $path || ! -f $path ]]; then
-    return 0
-  fi
+    local session_id cwd path prev prev_path prev_offset offset
+    # .sessionId (the transcript-filename UUID), NOT .id (the short
+    # background-job id claude agents/stop use) -- these are two different
+    # identifiers server.js is also careful to keep apart.
+    session_id=$(jq -r --arg n "$name" '.[] | select(.name == $n) | .sessionId' <<<"$roster")
+    cwd=$(workspace_for "$name")
+    [[ -n $session_id && $session_id != null && -n $cwd ]] || continue
 
-  if [[ $path != "$prev_path" ]]; then
-    # New (or first-ever) transcript file: seed at EOF, same as the
-    # webapp's own pollTranscriptDelta — never backfill years of history as
-    # "new" the first time this sees a session.
-    offset=$(stat -c %s -- "$path")
-    marker=$(jq --arg p "$path" --argjson o "$offset" '.transcript = {path:$p, offset:$o}' <<<"$marker")
-    printf '%s' "$marker" > "$notify_marker_path"
-    return 0
-  fi
+    path=$(find_transcript_path "$cwd" "$session_id") || path=""
+    [[ -n $path && -f $path ]] || continue
 
-  scan=$(scan_transcript_replies "$path" "$prev_offset")
-  new_offset=$(jq -r '.newOffset' <<<"$scan")
-  replies=$(jq -c '.replies' <<<"$scan")
+    prev=$(jq -c --arg n "$name" '.transcripts[$n] // {"path":"","offset":0}' <<<"$marker")
+    prev_path=$(jq -r '.path' <<<"$prev")
+    prev_offset=$(jq -r '.offset' <<<"$prev")
 
-  count=$(jq 'length' <<<"$replies")
-  local i=0
-  while (( i < count )); do
-    local from text
-    from=$(jq -r --argjson i "$i" '.[$i].from' <<<"$replies")
-    text=$(jq -r --argjson i "$i" '.[$i].text' <<<"$replies")
-    [[ -n $from ]] && apply_reply "$from" "$text"
-    i=$((i + 1))
-  done
+    if [[ $path != "$prev_path" ]]; then
+      # New (or first-ever) transcript file for this session: seed at EOF,
+      # same as the webapp's own pollTranscriptDelta — never backfill years
+      # of history as "new" the first time this sees a session.
+      offset=$(stat -c %s -- "$path")
+      marker=$(jq --arg n "$name" --arg p "$path" --argjson o "$offset" \
+        '.transcripts[$n] = {path:$p, offset:$o}' <<<"$marker")
+      continue
+    fi
 
-  marker=$(jq --arg p "$path" --argjson o "$new_offset" '.transcript = {path:$p, offset:$o}' <<<"$marker")
+    local scan new_offset msgs count i=0
+    scan=$(scan_transcript_messages "$path" "$prev_offset")
+    new_offset=$(jq -r '.newOffset' <<<"$scan")
+    msgs=$(jq -c '.messages' <<<"$scan")
+    count=$(jq 'length' <<<"$msgs")
+
+    while (( i < count )); do
+      local kind peer from text
+      kind=$(jq -r --argjson i "$i" '.[$i].kind' <<<"$msgs")
+      peer=$(jq -r --argjson i "$i" '.[$i].peer' <<<"$msgs")
+      from=$(jq -r --argjson i "$i" '.[$i].from // ""' <<<"$msgs")
+      text=$(jq -r --argjson i "$i" '.[$i].text' <<<"$msgs")
+
+      if [[ $name == boss && $kind == user && $peer == true ]]; then
+        # Job 1: already gets its own, nicer notification via the
+        # transitions check in cmd_notifications_check — don't double it up.
+        [[ -n $from ]] && apply_reply "$from" "$text"
+      elif ! is_terminal_focused "$name"; then
+        notify_generic_message "$name" "$kind" "$text"
+        marker=$(jq --arg n "$name" '.unseen = ((.unseen // []) + [$n] | unique)' <<<"$marker")
+      fi
+      i=$((i + 1))
+    done
+
+    marker=$(jq --arg n "$name" --arg p "$path" --argjson o "$new_offset" \
+      '.transcripts[$n] = {path:$p, offset:$o}' <<<"$marker")
+  done <<<"$names"
+
   printf '%s' "$marker" > "$notify_marker_path"
 }
 
 # --- notify-check ------------------------------------------------------------
 #
-# advanceTasksOnReply's standalone equivalent (cmd_poll_replies above,
-# called first thing below) flips a task's status from in_progress to
+# advanceTasksOnReply's standalone equivalent (cmd_poll_all above, called
+# first thing below) flips a task's status from in_progress to
 # approved_questions the moment that member's reply lands in boss's own
 # transcript, filling in .reply. Marking a task done by hand is the other
-# terminal transition. There is no on-disk trace of the webapp's other,
-# purely in-memory "sound/browser-notification" signal (flushPendingNotify /
-# pendingNotify) — it's broadcast live over its own websocket to connected
-# browser tabs and never written anywhere, so it isn't something a
-# file-polling plugin like this one can observe after the fact. Tracking
-# task-status transitions instead is both fully file-based and a closer
-# match for what was actually asked: a notification when a task you sent is
-# done, not every intermediate peer message.
+# terminal transition. cmd_poll_all also fires its own, broader
+# notifications for every other message in every session (job 2) — this
+# function layers a second, task-specific notification on top for the
+# common "a task you sent just finished" case, since that deserves a nicer
+# headline/body than the generic one.
 notify_marker_path=$HOME/.config/omarchy/legion-notify-marker.json
 
 read_marker() {
-  read_json_or "$notify_marker_path" '{"lastSeenTs":0,"taskStatuses":{},"transcript":{"path":"","offset":0}}'
+  read_json_or "$notify_marker_path" '{"lastSeenTs":0,"taskStatuses":{},"transcripts":{},"unseen":[]}'
 }
 
 notification_sound_path=/usr/share/sounds/freedesktop/stereo/complete.oga
@@ -365,28 +455,31 @@ play_notification_sound() {
 }
 
 cmd_notifications_check() {
-  local marker last_seen prev_statuses tasks transitions count
+  local marker prev_statuses tasks transitions count
 
-  # Standalone reply detection first: this is what actually produces the
-  # in_progress -> approved_questions transitions below now, independently
-  # of whether the webapp is running.
-  cmd_poll_replies
+  # Job 1 + job 2 (see the comment block above cmd_poll_all): advances
+  # tasks on a boss-side peer reply, and fires the broad generic
+  # notification for every other message in every session. Writes its own
+  # marker update (.transcripts / .unseen) before returning.
+  cmd_poll_all
 
   marker=$(read_marker)
-  last_seen=$(jq -r '.lastSeenTs // 0' <<<"$marker")
   prev_statuses=$(jq -c '.taskStatuses // {}' <<<"$marker")
 
   tasks=$(load_tasks)
 
   # One-shot: tasks that moved OUT of in_progress since the LAST check call
-  # (auto-advanced to approved_questions by cmd_poll_replies just above, or
-  # marked done by hand from either UI) — fires exactly one desktop
-  # notification per transition, never repeats for the same one.
+  # (auto-advanced to approved_questions by cmd_poll_all just above, or
+  # marked done by hand from either UI) — fires exactly one, nicer desktop
+  # notification per transition (on top of whatever job 2 already fired for
+  # the same underlying message), gated the same way on that member's
+  # terminal not being focused.
   transitions=$(jq --argjson prev "$prev_statuses" '
     [.[] | select(($prev[.id] // "") == "in_progress" and .status != "in_progress")]
   ' <<<"$tasks")
 
   count=$(jq 'length' <<<"$transitions")
+  local newly_unseen='[]'
   local i=0
   while (( i < count )); do
     local member title status reply headline body
@@ -394,41 +487,33 @@ cmd_notifications_check() {
     title=$(jq -r --argjson i "$i" '.[$i].title' <<<"$transitions")
     status=$(jq -r --argjson i "$i" '.[$i].status' <<<"$transitions")
     reply=$(jq -r --argjson i "$i" '.[$i].reply.text // ""' <<<"$transitions")
-    headline="$member — opdracht klaar"
-    body="\"$title\""
-    [[ $status == done ]] && body="$body (afgerond)"
-    [[ -n $reply ]] && body="$body: $reply"
-    omarchy-notification-send --app-name legion -u normal \
-      "$headline" "$body" \
-      --exec omarchy-shell r3mcos3.legion toggle \
-      >/dev/null 2>&1 || true
-    play_notification_sound
+    if ! is_terminal_focused "$member"; then
+      headline="$member — opdracht klaar"
+      body="\"$title\""
+      [[ $status == done ]] && body="$body (afgerond)"
+      [[ -n $reply ]] && body="$body: $reply"
+      omarchy-notification-send --app-name legion -u normal \
+        "$headline" "$body" \
+        --exec omarchy-shell r3mcos3.legion toggle \
+        >/dev/null 2>&1 || true
+      play_notification_sound
+      newly_unseen=$(jq --arg m "$member" '. + [$m]' <<<"$newly_unseen")
+    fi
     i=$((i + 1))
   done
 
   # Persist (not just changed ones, so a task that goes in_progress again
   # later — a follow-up message — is correctly seen as "was in_progress" on
   # its next transition too). Merges into the CURRENT on-disk marker rather
-  # than rebuilding from scratch, so this doesn't clobber the .transcript
-  # offset cmd_poll_replies just wrote above.
+  # than rebuilding from scratch, so this doesn't clobber what cmd_poll_all
+  # just wrote (.transcripts / .unseen).
   local new_statuses
   new_statuses=$(jq '[.[] | {key: .id, value: .status}] | from_entries' <<<"$tasks")
-  jq --argjson ts "$last_seen" --argjson statuses "$new_statuses" \
-    '.lastSeenTs = $ts | .taskStatuses = $statuses' <<<"$(read_marker)" > "$notify_marker_path"
+  jq --argjson statuses "$new_statuses" --argjson extra "$newly_unseen" \
+    '.taskStatuses = $statuses | .unseen = ((.unseen // []) + $extra | unique)' \
+    <<<"$(read_marker)" > "$notify_marker_path"
 
-  # Ongoing, not a delta: which members have a resolved task (reply landed,
-  # or marked done) still unacknowledged since lastSeenTs. This is what
-  # drives the blink — it keeps reporting the same members on every poll
-  # until mark-seen moves lastSeenTs forward, rather than firing once and
-  # going quiet like the notification above.
-  local unseen_members
-  unseen_members=$(jq --argjson since "$last_seen" '
-    [.[] | select(.status == "approved_questions" or .status == "done")
-         | select((.reply.at // .doneAt // 0) > $since)
-         | .member] | unique
-  ' <<<"$tasks")
-
-  jq -n --argjson fired "$count" --argjson members "$unseen_members" \
+  jq -n --argjson fired "$count" --argjson members "$(jq '.unseen // []' <<<"$(read_marker)")" \
     '{fired:$fired, unseenMembers:$members}'
 }
 
@@ -437,7 +522,7 @@ cmd_notifications_mark_seen() {
   now=$(date +%s%3N)
   marker=$(read_marker)
   mkdir -p -- "$(dirname -- "$notify_marker_path")"
-  jq --argjson ts "$now" '.lastSeenTs = $ts' <<<"$marker" > "$notify_marker_path"
+  jq --argjson ts "$now" '.lastSeenTs = $ts | .unseen = []' <<<"$marker" > "$notify_marker_path"
   jq -n --argjson ts "$now" '{ok:true, lastSeenTs:$ts}'
 }
 
@@ -623,6 +708,36 @@ cmd_session_restart() {
   cmd_session_start "$name"
 }
 
+# Bootstraps the whole legion from cold, standalone — no dependency on the
+# webapp or its start-sessions.sh being invoked by hand. If boss isn't
+# running, starts ONLY boss: boss's own SessionStart hook (session-start-
+# hook.sh in claude-legion) then brings up the fixed five + any dynamic
+# members itself, exactly as it always has — no need to duplicate that
+# cascade here. If boss is already up, that hook has already run at some
+# point, so instead directly (re)start whichever fixed/dynamic member is
+# currently not online — covers "boss is fine but one member crashed".
+cmd_start_all() {
+  local roster boss_online
+  roster=$(run_agents_json)
+  boss_online=$(jq -e 'any(.[]; .name == "boss")' <<<"$roster" >/dev/null 2>&1 && echo true || echo false)
+
+  if [[ $boss_online != true ]]; then
+    cmd_session_start boss >/dev/null
+    jq -n '{ok:true, note:"boss started — its own startup hook brings up the rest"}'
+    return 0
+  fi
+
+  local name names=("${fixed_names[@]}")
+  while IFS= read -r name; do
+    [[ -n $name ]] && names+=("$name")
+  done < <(dynamic_members_json | jq -r '.[].name')
+
+  for name in "${names[@]}"; do
+    cmd_session_start "$name" >/dev/null 2>&1 || true
+  done
+  jq -n '{ok:true}'
+}
+
 # --- dispatch ------------------------------------------------------------------
 
 command_name=${1:-}
@@ -702,6 +817,10 @@ case $command_name in
       restart) cmd_session_restart "$name" ;;
       *) usage_error ;;
     esac
+    ;;
+  start-all)
+    (($# == 1)) || usage_error
+    cmd_start_all
     ;;
   *)
     usage_error

@@ -1,14 +1,16 @@
 # Legion
 
 A native Omarchy bar panel for the [claude-legion](https://github.com/r3mcos3/claude-legion)
-coordinator setup — a personal-use alternative to opening the dashboard
-webapp in a browser tab. Runs fully standalone: it doesn't call the webapp
-at all (no HTTP request to it anywhere), and doesn't need it running for
-anything, including the reply-detection that drives the blink (see
-"Standalone reply detection" below). It shares `members.json` / `tasks.json`
-/ `cron-jobs.json` as plain files with the webapp when it happens to be
-running too, purely so either interface reflects changes made through the
-other — that's a convenience, not a dependency.
+coordinator setup — a personal-use alternative to the dashboard webapp.
+Runs fully standalone, including bootstrapping the legion from cold: no
+HTTP request to the webapp anywhere, and nothing it does — starting
+sessions, detecting replies, notifying — needs the webapp running.
+`session-start-hook.sh` in claude-legion no longer auto-starts the webapp
+either, precisely because this plugin replaces that need. It shares
+`members.json` / `tasks.json` / `cron-jobs.json` as plain files with the
+webapp when it happens to be running too (started by hand — `cd dashboard
+&& node server.js`), purely so either interface reflects changes made
+through the other — that's a convenience, not a dependency.
 
 Not intended for the Omarchy plugin marketplace — this is tied to one
 specific personal legion setup (fixed session names, workspace paths,
@@ -26,25 +28,40 @@ install and get value from.
   board): create one, send it (typed live into the member's session via a
   headless pty), mark it done.
 - **Cronjobs** — read-only view of `cron-jobs.json`.
-- **Meldingen** — the bar icon (and the specific member's own roster row)
-  blinks when a task you sent gets a reply or is marked done, plus a real
-  clickable desktop notification via `omarchy-notification-send`. Checked
-  every 15s, independently of whether the panel is open — see below for how
-  this is detected without the webapp.
+- **Meldingen** — a desktop notification (`omarchy-notification-send`) + a
+  chime + a blink (the bar icon and that member's own roster row) for
+  basically every "vraag of antwoord" in any session: a task reply/done,
+  but also a plain question landing on a member (typed by hand, or a
+  cross-session message) and that member's own text answer — deliberately
+  broad, see "Standalone message detection" below. Suppressed only when
+  that specific member's own terminal window (opened via the panel's
+  "terminal" button) currently has focus — you're already looking at it.
+  Checked every 15s, independently of whether the panel is open.
 - **Verbruik** — 5h/7d rate-limit percentage from
   `~/.claude/usage-cache.json`, with exact reset times on hover.
 - **Lid toevoegen** — name + absolute workspace path (mkdir, sets
   `worktree.bgIsolation: none`, starts the session).
+- **Start alles** — a header button next to the roster that bootstraps the
+  whole legion from cold: starts boss if it isn't running (its own
+  `session-start-hook.sh` then brings up the fixed five + any dynamic
+  members, same as it always has), or — if boss is already up — directly
+  restarts whichever fixed/dynamic member isn't currently online. No
+  terminal, no `start-sessions.sh` by hand, no webapp needed for this either.
 
-## Standalone reply detection
+## Standalone message detection
 
-The one piece that used to depend on the webapp actually running: knowing
-that a member replied to a task. The webapp's own `advanceTasksOnReply` gets
-this from polling that member's transcript for a message landing back in
-**boss's own transcript** — so this plugin polls the exact same file boss
-already has (`~/.claude/projects/<cwd>/<sessionId>.jsonl`), looking for a
-reply arriving via `SendMessage`. That shows up in the transcript in a few
-different shapes depending on timing:
+Every known session (boss + fixed + dynamic) has its own transcript
+(`~/.claude/projects/<cwd>/<sessionId>.jsonl`), polled independently, each
+with its own incremental byte offset persisted in
+`~/.config/omarchy/legion-notify-marker.json` (seeded at end-of-file the
+first time a given transcript path is seen, so it never replays years of
+history as "new" — and re-seeds the same way if a session's transcript file
+changes, e.g. after a restart). Two things come out of that one scan:
+
+**1. Task-reply detection** (this used to be the webapp's job, via
+`advanceTasksOnReply` polling **boss's own transcript** for a message
+landing back from a member). A reply sent via `SendMessage` shows up there
+in one of a few shapes depending on timing:
 
 - a plain `type:"user"` entry whose string content wraps a
   `<cross-session-message from-name="X">...</cross-session-message>` tag —
@@ -56,13 +73,34 @@ different shapes depending on timing:
   doesn't care about `attachment.type`, only `origin.kind`, so this shape
   needed no special-casing).
 
-Whichever shape it lands in, finding one advances the oldest `in_progress`
-task for that member to `approved_questions` and fills in `.reply` — same
-rule as the webapp (a member works one task at a time). The scan is
-incremental (a byte offset persisted in
-`~/.config/omarchy/legion-notify-marker.json`, seeded at end-of-file the
-first time a given transcript path is seen so it never replays years of
-history as "new"), same shape as the webapp's own delta-polling.
+Finding one advances the oldest `in_progress` task for that member to
+`approved_questions` and fills in `.reply` — same rule as the webapp (a
+member works one task at a time).
+
+**2. General "vraag of antwoord" notifications.** Every OTHER new message in
+every session's own transcript — a `type:"user"` entry (a prompt someone
+typed at that member, or a cross-session message addressed to it) or a
+`type:"assistant"` entry with a text block (that member's own answer) —
+fires a desktop notification, plays a chime, and marks that member `unseen`
+(the blink), unless its terminal window currently has focus (see below).
+This is deliberately broad: a chatty session notifies a lot. Boss's own
+peer-origin replies are excluded here specifically because job 1 above
+already gives them a nicer, task-specific notification — everything else,
+including boss's own plain assistant text (e.g. its final answer to you in
+chat), goes through this path.
+
+### Focus check
+
+A member's terminal only counts as "in beeld" if it's the currently
+*focused* window (`hyprctl activewindow -j`), matched by `initialTitle`
+rather than the live `title` — Alacritty's `--title` sets the title once at
+launch, but the program running inside it (the shell, `claude attach`) can
+rewrite the live title afterward, while Hyprland's `initialTitle` stays
+exactly what it was at window-map time. `openTerminalFor()` in Panel.qml
+passes `--title "legion:<name>"` for this reason; a `claude attach` window
+opened any other way has no matching title and is simply never treated as
+"that member is on screen". No matching window, or no `hyprctl` at all,
+both mean "not focused" — the safe default is to notify.
 
 ## What it deliberately does NOT do
 
