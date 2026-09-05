@@ -201,19 +201,18 @@ read_marker() {
 }
 
 cmd_notifications_check() {
-  local marker last_seen prev_statuses entries tasks unseen_count transitions count
+  local marker last_seen prev_statuses tasks transitions count
 
   marker=$(read_marker)
   last_seen=$(jq -r '.lastSeenTs // 0' <<<"$marker")
   prev_statuses=$(jq -c '.taskStatuses // {}' <<<"$marker")
 
-  entries=$(read_json_or "$log_path" '[]')
-  unseen_count=$(jq --argjson since "$last_seen" '[.[] | select(.ts > $since)] | length' <<<"$entries")
-
   tasks=$(load_tasks)
-  # Tasks that just moved OUT of in_progress since the last check (either
-  # auto-advanced to approved_questions by the webapp's reply detection, or
-  # marked done by hand from either UI).
+
+  # One-shot: tasks that moved OUT of in_progress since the LAST check call
+  # (either auto-advanced to approved_questions by the webapp's reply
+  # detection, or marked done by hand from either UI) — fires exactly one
+  # desktop notification per transition, never repeats for the same one.
   transitions=$(jq --argjson prev "$prev_statuses" '
     [.[] | select(($prev[.id] // "") == "in_progress" and .status != "in_progress")]
   ' <<<"$tasks")
@@ -237,15 +236,28 @@ cmd_notifications_check() {
     i=$((i + 1))
   done
 
-  # Persist the full current status map (not just changed ones) so a task
-  # that goes in_progress again later (a follow-up message) is correctly
-  # seen as "was in_progress" on its next transition too.
+  # Persist (not just changed ones, so a task that goes in_progress again
+  # later — a follow-up message — is correctly seen as "was in_progress" on
+  # its next transition too).
   local new_statuses
   new_statuses=$(jq '[.[] | {key: .id, value: .status}] | from_entries' <<<"$tasks")
   jq -n --argjson ts "$last_seen" --argjson statuses "$new_statuses" \
     '{lastSeenTs:$ts, taskStatuses:$statuses}' > "$notify_marker_path"
 
-  jq -n --argjson fired "$count" --argjson unseen "$unseen_count" '{fired:$fired, unseenCount:$unseen}'
+  # Ongoing, not a delta: which members have a resolved task (reply landed,
+  # or marked done) still unacknowledged since lastSeenTs. This is what
+  # drives the blink — it keeps reporting the same members on every poll
+  # until mark-seen moves lastSeenTs forward, rather than firing once and
+  # going quiet like the notification above.
+  local unseen_members
+  unseen_members=$(jq --argjson since "$last_seen" '
+    [.[] | select(.status == "approved_questions" or .status == "done")
+         | select((.reply.at // .doneAt // 0) > $since)
+         | .member] | unique
+  ' <<<"$tasks")
+
+  jq -n --argjson fired "$count" --argjson members "$unseen_members" \
+    '{fired:$fired, unseenMembers:$members}'
 }
 
 cmd_notifications_mark_seen() {

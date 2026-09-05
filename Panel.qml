@@ -224,20 +224,26 @@ Panel {
   // it rather than listening for a push. Runs constantly from
   // Component.onCompleted, not just while the panel is open, since the
   // whole point is finding out without having to check.
-  property int unseenCount: 0
+  //
+  // unseenMembers (not a count) drives two things: the bar icon blinks
+  // whenever it's non-empty, and each named member's own roster row blinks
+  // too, so opening the panel points straight at who actually needs
+  // attention instead of a bare number.
+  property var unseenMembers: []
+  readonly property bool hasUnseen: unseenMembers.length > 0
 
   function checkNotifications() {
     runJson(["notifications", "check"], function(code, text) {
       if (code !== 0) return
       try {
         var result = JSON.parse(text)
-        root.unseenCount = result.unseenCount || 0
+        root.unseenMembers = result.unseenMembers || []
       } catch (e) { /* transient parse hiccup — next poll corrects it */ }
     })
   }
 
   function markNotificationsSeen() {
-    root.unseenCount = 0
+    root.unseenMembers = []
     runJson(["notifications", "mark-seen"], function() {})
   }
 
@@ -272,7 +278,7 @@ Panel {
     text: "\uf0c0"
     tooltipText: [
       root.offlineCount > 0 ? (root.offlineCount + " offline") : "",
-      root.unseenCount > 0 ? (root.unseenCount + " nieuw") : ""
+      root.hasUnseen ? ("reactie van " + root.unseenMembers.join(", ")) : ""
     ].filter(function(s) { return s !== "" }).join(" \u00b7 ") || "Legion"
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.LeftButton) root.toggle()
@@ -289,31 +295,15 @@ Panel {
     visible: root.offlineCount > 0
   }
 
-  // Unseen-notifications badge: a completed task is a change in shared
-  // state, not a one-off event to react to, so this is what "you weren't
-  // looking, but something happened" looks like here -- see checkNotifications.
-  Rectangle {
-    id: unseenBadge
-    visible: root.unseenCount > 0
-    width: Math.max(Style.space(14), badgeLabel.implicitWidth + Style.space(6))
-    height: Style.space(14)
-    radius: height / 2
-    color: Color.accent
-    anchors.top: button.top
-    anchors.right: button.right
-    anchors.topMargin: -Style.space(2)
-    anchors.rightMargin: -Style.space(2)
-
-    Text {
-      id: badgeLabel
-      anchors.centerIn: parent
-      textFormat: Text.PlainText
-      text: root.unseenCount > 99 ? "99+" : String(root.unseenCount)
-      color: Color.background
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      font.bold: true
-    }
+  // Blinks the bar icon itself instead of a numbered badge -- see
+  // checkNotifications / RosterRow.isUnseen for the matching per-member
+  // blink in the roster list below. Both stop the moment the panel opens.
+  SequentialAnimation {
+    running: root.hasUnseen
+    loops: Animation.Infinite
+    onRunningChanged: if (!running) button.opacity = 1.0
+    NumberAnimation { target: button; property: "opacity"; from: 1.0; to: 0.3; duration: 550; easing.type: Easing.InOutQuad }
+    NumberAnimation { target: button; property: "opacity"; from: 0.3; to: 1.0; duration: 550; easing.type: Easing.InOutQuad }
   }
 
   KeyboardPanel {
@@ -624,12 +614,25 @@ Panel {
   component RosterRow: CursorSurface {
     id: rosterRow
     property var entry: null
+    readonly property bool isUnseen: rosterRow.entry
+      ? root.unseenMembers.indexOf(rosterRow.entry.name) !== -1 : false
 
     foreground: root.foreground
     hasCursor: rowHover.hovered
     implicitHeight: rowLayout.implicitHeight + Style.space(4)
 
     HoverHandler { id: rowHover }
+
+    // Points at exactly who replied/asked something, instead of a bare
+    // count elsewhere — stops the moment the panel is opened (see
+    // markNotificationsSeen), same trigger as the bar icon's own blink.
+    SequentialAnimation {
+      running: rosterRow.isUnseen
+      loops: Animation.Infinite
+      onRunningChanged: if (!running) rosterRow.opacity = 1.0
+      NumberAnimation { target: rosterRow; property: "opacity"; from: 1.0; to: 0.35; duration: 550; easing.type: Easing.InOutQuad }
+      NumberAnimation { target: rosterRow; property: "opacity"; from: 0.35; to: 1.0; duration: 550; easing.type: Easing.InOutQuad }
+    }
 
     RowLayout {
       id: rowLayout
