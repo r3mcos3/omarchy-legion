@@ -492,6 +492,9 @@ cmd_poll_all() {
         # Job 1: already gets its own, nicer notification via the
         # transitions check in cmd_notifications_check — don't double it up.
         [[ -n $from ]] && apply_reply "$from" "$text"
+      elif [[ $name == boss && $kind == user && $peer == false ]]; then
+        : # Remco's own message straight to boss (this very conversation) —
+          # never worth notifying him about something he just typed himself.
       elif ! is_terminal_focused "$name"; then
         notify_generic_message "$name" "$kind" "$text"
         marker=$(jq --arg n "$name" '.unseen = ((.unseen // []) + [$n] | unique)' <<<"$marker")

@@ -99,10 +99,12 @@ discards it, no notification. A tool-result-only `user` entry (the
 mechanical feedback loop, not a real turn) confirms nothing either way.
 Either kind fires a desktop notification, plays a chime, and marks that
 member `unseen` (the blink), unless its terminal window currently has
-focus (see below). Boss's own peer-origin replies are excluded here
-specifically because job 1 above already gives them a nicer, task-specific
-notification — everything else, including boss's own final answer to you
-in chat, goes through this path.
+focus (see below). Two things never fire this way for boss specifically:
+its own peer-origin replies (job 1 above already gives those a nicer,
+task-specific notification), and a plain message straight from Remco —
+that's just this conversation, and there's no point notifying him about
+something he only just typed. Everything else, including boss's own final
+answer to you in chat, goes through this path.
 
 ### Focus check
 
