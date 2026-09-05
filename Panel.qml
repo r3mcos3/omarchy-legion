@@ -185,7 +185,7 @@ Panel {
   }
 
   function addTask() {
-    var member = taskMemberField.text.trim()
+    var member = taskMemberField.value
     var title = taskTitleField.text.trim()
     var message = taskMessageField.text.trim()
     if (!member || !title || !message) { root.formError = "Lid, titel en tekst zijn verplicht."; return }
@@ -201,7 +201,9 @@ Panel {
       if (exitCode !== 0) {
         root.formError = stderrText || "Aanmaken opdracht mislukt."
       } else {
-        taskMemberField.text = ""
+        // Leave taskMemberField's selection as-is — convenient when sending
+        // several tasks to the same member in a row, and there is no
+        // natural "empty" value for a dropdown the way a blank TextField has.
         taskTitleField.text = ""
         taskMessageField.text = ""
       }
@@ -406,14 +408,22 @@ Panel {
             spacing: Style.space(4)
             enabled: !root.actionBusy
 
-            TextField {
+            Dropdown {
               id: taskMemberField
               width: parent.width
-              placeholderText: "lid (naam)"
+              showLabel: false
+              // Always the live roster (fixed + dynamic + whatever's been
+              // added since), not a hardcoded list — a future member shows
+              // up here the moment it appears in roster.json/agents --json.
+              options: root.roster.map(function(m) { return m.name })
+              // Defaults to the first roster entry so a quick title+message
+              // doesn't require touching the dropdown at all; picking one by
+              // hand overrides this binding (standard QML: an imperative
+              // assignment breaks an existing property binding) and sticks
+              // across later roster refreshes.
+              value: root.roster.length ? root.roster[0].name : ""
               foreground: root.foreground
-              font.family: root.fontFamily
-              horizontalPadding: Style.space(8)
-              verticalPadding: Style.space(6)
+              fontFamily: root.fontFamily
             }
             TextField {
               id: taskTitleField
