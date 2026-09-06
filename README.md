@@ -97,6 +97,16 @@ once a later poll confirms — a genuine next turn started — that it was
 never followed by more tool activity; a tool call arriving instead just
 discards it, no notification. A tool-result-only `user` entry (the
 mechanical feedback loop, not a real turn) confirms nothing either way.
+
+One tool call is an exception to "a tool call discards the pending
+candidate and nothing else happens": `AskUserQuestion`. It's a `tool_use`
+block, not text, so it would otherwise vanish the same way any other tool
+call does — but it is unambiguously a "this needs you right now" moment
+(the turn is blocked until you answer), arguably the clearest case of
+"vraag" this whole feature exists for. It fires its own `kind:"question"`
+message immediately, no confirm-on-next-turn wait, using the question
+text(s) from its `input.questions[]`.
+
 Either kind fires a desktop notification, plays a chime, and marks that
 member `unseen` (the blink), unless its terminal window currently has
 focus (see below). Two things never fire this way for boss specifically:

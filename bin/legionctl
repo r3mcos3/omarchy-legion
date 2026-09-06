@@ -322,12 +322,26 @@ for raw_line in usable.split(b"\n"):
             confirm_pending()
             messages.append({"kind": "user", "peer": True, "from": origin.get("name", ""), "text": (origin.get("body") or "").strip()})
     elif etype == "assistant":
-        content = (entry.get("message") or {}).get("content")
+        content = (entry.get("message") or {}).get("content") or []
         texts = text_blocks(content)
         if texts:
             pending = " ".join(texts)  # new unconfirmed candidate, supersedes any older one
-        elif any(isinstance(b, dict) and b.get("type") == "tool_use" for b in (content or [])):
+        elif any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content):
             pending = None  # a tool call followed — whatever was pending is proven non-final
+        # AskUserQuestion is a tool_use, not a text block, but it is
+        # unambiguously "needs your attention right now" — unlike a plain
+        # status update it never needs the confirm-on-next-turn treatment,
+        # so it fires immediately rather than joining the pending dance
+        # above (which still runs as normal for it, same as any tool call).
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "AskUserQuestion":
+                qtexts = [
+                    (q.get("question") or "").strip()
+                    for q in ((block.get("input") or {}).get("questions") or [])
+                    if (q.get("question") or "").strip()
+                ]
+                if qtexts:
+                    messages.append({"kind": "question", "peer": False, "from": None, "text": " / ".join(qtexts)})
 
 print(json.dumps({"newOffset": new_offset, "messages": messages, "pending": pending}))
 ' "$1" "$2" "$3"
@@ -414,6 +428,8 @@ notify_generic_message() {
   fi
   if [[ $kind == user ]]; then
     headline="$name — nieuwe vraag"
+  elif [[ $kind == question ]]; then
+    headline="$name — wacht op je antwoord"
   else
     headline="$name — antwoord"
   fi
