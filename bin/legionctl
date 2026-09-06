@@ -229,24 +229,30 @@ find_transcript_path() {
 }
 
 # Reads new complete lines since $2 (byte offset) and prints
-# {newOffset, messages:[{kind, peer, from, text}], pending}. kind is "user"
-# (a prompt landing on this session, by hand or via cross-session-message)
-# or "assistant" (a *confirmed-final* text answer — see below); peer/from
-# are set only for a recognized cross-session-message or peer-origin
-# attachment.
+# {newOffset, messages:[{kind, peer, from, text}], pending}.
 #
-# A turn's assistant text-block-only messages and its tool-call messages
-# are never mixed in the same transcript entry here — a status update like
-# "checking the file now" and the tool call it precedes are always two
-# separate entries — so text presence alone can't tell an intermediate
-# one-liner apart from the actual final answer. What can: whether another
-# assistant entry (i.e. a tool call, since that's the only thing that
-# follows a mid-turn update) comes after it before the turn hands back to
-# a real user/peer entry. $3 carries the still-unconfirmed candidate text
-# from the previous poll (or "") so this holds across polls; a still-
-# unconfirmed candidate at the end of THIS batch is returned as `pending`
-# for the next poll to keep tracking, not fired yet. A tool-result-only
-# user entry doesn't confirm anything — the agentic loop just continues.
+# `messages` only ever carries two notify-worthy kinds now:
+# - "user" (peer:true only): a cross-session/attachment reply landing here
+#   — used solely for job 1's apply_reply (see below), on boss's transcript.
+#   A plain, non-peer user entry (Remco typing directly, or a task injected
+#   via pty_send) is never notify-worthy on its own — self-inflicted either
+#   way — so it's not emitted as a message at all, just clears `pending`
+#   below since it starts a new turn.
+# - "question": an AskUserQuestion tool call, fired immediately — the
+#   clearest "needs you right now" signal there is.
+#
+# `pending` is the latest unconfirmed candidate: text from the most recent
+# text-only assistant entry (text and a tool call are never mixed in the
+# same entry here), cleared the moment a tool call or a new user turn
+# follows it. It is NOT auto-flushed into a message here — deliberately:
+# confirming it only once a NEXT turn starts meant the "you're done"
+# notification could only fire after Remco had already typed his next
+# question, which defeats the point. cmd_poll_all instead flushes `pending`
+# into a notification the moment that session's live status transitions
+# from busy to idle — the real "done" signal, checked separately per poll
+# against `claude agents --json`, not against transcript structure. $3
+# carries `pending` in from the previous poll so it survives across polls
+# until flushed or superseded.
 #
 # A NUL-safe, binary-aware read (not `tail -c`/`dd` chained through bash)
 # because JSONL transcript content is arbitrary text; only ever processes
@@ -286,12 +292,6 @@ def text_blocks(content):
                 out.append(t)
     return out
 
-def confirm_pending():
-    global pending
-    if pending:
-        messages.append({"kind": "assistant", "peer": False, "from": None, "text": pending})
-    pending = None
-
 for raw_line in usable.split(b"\n"):
     raw_line = raw_line.strip()
     if not raw_line:
@@ -307,19 +307,15 @@ for raw_line in usable.split(b"\n"):
         candidates = [content] if isinstance(content, str) else text_blocks(content)
         if not candidates:
             continue  # tool-result-only feedback — loop continues, not a turn boundary
-        confirm_pending()
+        pending = None  # a real new turn started; any earlier candidate is moot
         for t in candidates:
             m = CROSS_SESSION_RE.search(t)
             if m:
                 messages.append({"kind": "user", "peer": True, "from": m.group(1), "text": m.group(2).strip()})
-            else:
-                t = t.strip()
-                if t:
-                    messages.append({"kind": "user", "peer": False, "from": None, "text": t})
     elif etype == "attachment":
         origin = ((entry.get("attachment") or {}).get("origin")) or {}
         if origin.get("kind") == "peer":
-            confirm_pending()
+            pending = None
             messages.append({"kind": "user", "peer": True, "from": origin.get("name", ""), "text": (origin.get("body") or "").strip()})
     elif etype == "assistant":
         content = (entry.get("message") or {}).get("content") or []
@@ -328,11 +324,6 @@ for raw_line in usable.split(b"\n"):
             pending = " ".join(texts)  # new unconfirmed candidate, supersedes any older one
         elif any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content):
             pending = None  # a tool call followed — whatever was pending is proven non-final
-        # AskUserQuestion is a tool_use, not a text block, but it is
-        # unambiguously "needs your attention right now" — unlike a plain
-        # status update it never needs the confirm-on-next-turn treatment,
-        # so it fires immediately rather than joining the pending dance
-        # above (which still runs as normal for it, same as any tool call).
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "AskUserQuestion":
                 qtexts = [
@@ -390,6 +381,20 @@ find_terminal_window() {
   command -v hyprctl >/dev/null 2>&1 || return 0
   hyprctl clients -j 2>/dev/null | jq -r --arg t "legion:$name" \
     '[.[] | select(.initialTitle == $t)][0].address // empty' 2>/dev/null
+}
+
+# Job 2's generic notifications (final-answer + question) only make sense
+# when Remco is actually the one talking to this session directly: boss
+# (this very conversation, always), or a member whose "legion:<name>"
+# terminal he currently has open himself. A member only ever gets work
+# relayed via boss/tasks otherwise has no such window, and stays covered
+# by job 1's own task-completion notification instead — exactly the "ik
+# krijg een melding via jou" case, once per relayed exchange rather than
+# once from boss AND once from the member for the same thing.
+should_notify_member() {
+  local name=$1
+  [[ $name == boss ]] && return 0
+  [[ -n $(find_terminal_window "$name") ]]
 }
 
 # Opens a floating terminal for a member, or — if one is already open —
@@ -452,9 +457,7 @@ notify_generic_message() {
   if ((${#text} > 200)); then
     text="${text:0:200}…"
   fi
-  if [[ $kind == user ]]; then
-    headline="$name — nieuwe vraag"
-  elif [[ $kind == question ]]; then
+  if [[ $kind == question ]]; then
     headline="$name — wacht op je antwoord"
   else
     headline="$name — antwoord"
@@ -467,18 +470,18 @@ notify_generic_message() {
 }
 
 # Polls every known session's OWN transcript (not just boss's) for new
-# messages, advances tasks on a boss-side peer reply (job 1 above), and
-# fires a generic notification + blink for everything else (job 2), gated
-# on that member's terminal not currently being focused.
-#
-# Job 2 fires for an incoming "vraag" (a kind:user message landing on that
-# session) as soon as it arrives, and for a kind:assistant message only
-# once scan_transcript_messages has CONFIRMED it was the turn's actual
-# final answer, not one of the intermediate one-line status updates a busy
-# turn can emit along the way (see that function's own comment for how).
-# The still-unconfirmed candidate carries over between polls via
-# .pendingAnswers[name] — passed back in as scan_transcript_messages's 3rd
-# argument each time, and written back from its `pending` result below.
+# messages, advances tasks on a boss-side peer reply (job 1), and fires
+# job 2's notifications: a "question" (AskUserQuestion) immediately, and a
+# final-answer notification the moment that session's live status reads
+# idle AND there's still an unflushed pending candidate — not on the next
+# transcript turn, which would mean only finding out you're done after
+# Remco already typed his next message (reported directly, and
+# reproducible: confirming a candidate only once a following turn starts
+# is inherently one turn too late for "let me know you're finished"). Both
+# are gated by should_notify_member: boss always, any other member only
+# while Remco has their terminal open himself — a member worked purely
+# through boss/tasks relay stays covered by job 1's notification alone,
+# instead of also notifying separately for itself.
 cmd_poll_all() {
   local marker roster names name
 
@@ -489,68 +492,94 @@ cmd_poll_all() {
   while IFS= read -r name; do
     [[ -n $name ]] || continue
 
-    local session_id cwd path prev prev_path prev_offset offset
+    local session_id cwd live_status path prev prev_path prev_offset offset
     # .sessionId (the transcript-filename UUID), NOT .id (the short
     # background-job id claude agents/stop use) -- these are two different
     # identifiers server.js is also careful to keep apart.
     session_id=$(jq -r --arg n "$name" '.[] | select(.name == $n) | .sessionId' <<<"$roster")
     cwd=$(workspace_for "$name")
+    live_status=$(jq -r --arg n "$name" '.[] | select(.name == $n) | .status // ""' <<<"$roster")
     [[ -n $session_id && $session_id != null && -n $cwd ]] || continue
 
     path=$(find_transcript_path "$cwd" "$session_id") || path=""
-    [[ -n $path && -f $path ]] || continue
+    if [[ -n $path && -f $path ]]; then
+      prev=$(jq -c --arg n "$name" '.transcripts[$n] // {"path":"","offset":0}' <<<"$marker")
+      prev_path=$(jq -r '.path' <<<"$prev")
+      prev_offset=$(jq -r '.offset' <<<"$prev")
 
-    prev=$(jq -c --arg n "$name" '.transcripts[$n] // {"path":"","offset":0}' <<<"$marker")
-    prev_path=$(jq -r '.path' <<<"$prev")
-    prev_offset=$(jq -r '.offset' <<<"$prev")
+      if [[ $path != "$prev_path" ]]; then
+        # New (or first-ever) transcript file for this session: seed at EOF,
+        # same as the webapp's own pollTranscriptDelta — never backfill
+        # years of history as "new" the first time this sees a session.
+        # Also drops any pending candidate from the old file, which can
+        # never resolve now.
+        offset=$(stat -c %s -- "$path")
+        marker=$(jq --arg n "$name" --arg p "$path" --argjson o "$offset" \
+          '.transcripts[$n] = {path:$p, offset:$o} | del(.pendingAnswers[$n])' <<<"$marker")
+      else
+        local prev_pending scan new_offset new_pending msgs count i=0
+        prev_pending=$(jq -r --arg n "$name" '.pendingAnswers[$n] // ""' <<<"$marker")
+        scan=$(scan_transcript_messages "$path" "$prev_offset" "$prev_pending")
+        new_offset=$(jq -r '.newOffset' <<<"$scan")
+        new_pending=$(jq -r '.pending // ""' <<<"$scan")
+        msgs=$(jq -c '.messages' <<<"$scan")
+        count=$(jq 'length' <<<"$msgs")
 
-    if [[ $path != "$prev_path" ]]; then
-      # New (or first-ever) transcript file for this session: seed at EOF,
-      # same as the webapp's own pollTranscriptDelta — never backfill years
-      # of history as "new" the first time this sees a session. Also drops
-      # any pending candidate from the old file, which can never resolve now.
-      offset=$(stat -c %s -- "$path")
-      marker=$(jq --arg n "$name" --arg p "$path" --argjson o "$offset" \
-        '.transcripts[$n] = {path:$p, offset:$o} | del(.pendingAnswers[$n])' <<<"$marker")
-      continue
-    fi
+        while (( i < count )); do
+          local kind peer from text
+          kind=$(jq -r --argjson i "$i" '.[$i].kind' <<<"$msgs")
+          peer=$(jq -r --argjson i "$i" '.[$i].peer' <<<"$msgs")
+          from=$(jq -r --argjson i "$i" '.[$i].from // ""' <<<"$msgs")
+          text=$(jq -r --argjson i "$i" '.[$i].text' <<<"$msgs")
 
-    local prev_pending scan new_offset new_pending msgs count i=0
-    prev_pending=$(jq -r --arg n "$name" '.pendingAnswers[$n] // ""' <<<"$marker")
-    scan=$(scan_transcript_messages "$path" "$prev_offset" "$prev_pending")
-    new_offset=$(jq -r '.newOffset' <<<"$scan")
-    new_pending=$(jq -r '.pending // ""' <<<"$scan")
-    msgs=$(jq -c '.messages' <<<"$scan")
-    count=$(jq 'length' <<<"$msgs")
+          if [[ $kind == user && $peer == true && $name == boss ]]; then
+            # Job 1: already gets its own, nicer notification via the
+            # transitions check in cmd_notifications_check.
+            [[ -n $from ]] && apply_reply "$from" "$text"
+          elif [[ $kind == question ]] && should_notify_member "$name" && ! is_terminal_focused "$name"; then
+            notify_generic_message "$name" "question" "$text"
+            marker=$(jq --arg n "$name" '.unseen = ((.unseen // []) + [$n] | unique)' <<<"$marker")
+          fi
+          # kind:user, peer:false (Remco typing directly, or a pty_send
+          # task) and kind:user, peer:true on a non-boss member (internal
+          # relay traffic to/from boss) are never notify-worthy on their
+          # own — nothing to do for either here.
+          i=$((i + 1))
+        done
 
-    while (( i < count )); do
-      local kind peer from text
-      kind=$(jq -r --argjson i "$i" '.[$i].kind' <<<"$msgs")
-      peer=$(jq -r --argjson i "$i" '.[$i].peer' <<<"$msgs")
-      from=$(jq -r --argjson i "$i" '.[$i].from // ""' <<<"$msgs")
-      text=$(jq -r --argjson i "$i" '.[$i].text' <<<"$msgs")
-
-      if [[ $name == boss && $kind == user && $peer == true ]]; then
-        # Job 1: already gets its own, nicer notification via the
-        # transitions check in cmd_notifications_check — don't double it up.
-        [[ -n $from ]] && apply_reply "$from" "$text"
-      elif [[ $name == boss && $kind == user && $peer == false ]]; then
-        : # Remco's own message straight to boss (this very conversation) —
-          # never worth notifying him about something he just typed himself.
-      elif ! is_terminal_focused "$name"; then
-        notify_generic_message "$name" "$kind" "$text"
-        marker=$(jq --arg n "$name" '.unseen = ((.unseen // []) + [$n] | unique)' <<<"$marker")
+        if [[ -n $new_pending ]]; then
+          marker=$(jq --arg n "$name" --arg t "$new_pending" '.pendingAnswers[$n] = $t' <<<"$marker")
+        else
+          marker=$(jq --arg n "$name" 'del(.pendingAnswers[$n])' <<<"$marker")
+        fi
+        marker=$(jq --arg n "$name" --arg p "$path" --argjson o "$new_offset" \
+          '.transcripts[$n] = {path:$p, offset:$o}' <<<"$marker")
       fi
-      i=$((i + 1))
-    done
-
-    if [[ -n $new_pending ]]; then
-      marker=$(jq --arg n "$name" --arg t "$new_pending" '.pendingAnswers[$n] = $t' <<<"$marker")
-    else
-      marker=$(jq --arg n "$name" 'del(.pendingAnswers[$n])' <<<"$marker")
     fi
-    marker=$(jq --arg n "$name" --arg p "$path" --argjson o "$new_offset" \
-      '.transcripts[$n] = {path:$p, offset:$o}' <<<"$marker")
+
+    # The actual "done" signal: live status reads idle AND there's still an
+    # unflushed pending candidate. Deliberately NOT a busy->idle edge — a
+    # first attempt at that missed the flush entirely whenever the status
+    # settled back to idle on an earlier poll than the one whose transcript
+    # scan actually caught the final text (confirmed live: a member's
+    # last "TESTANTWOORD-XYZ" sat in .pendingAnswers indefinitely because
+    # by the time the scan reached it, .lastStatus had already recorded
+    # "idle" on a prior poll, so no busy->idle transition was ever seen
+    # again for it). Checking "idle now" plus "pending non-empty" needs no
+    # edge and no per-session status history: `pending` itself is already
+    # the "is there anything new to report" signal, cleared the instant it
+    # flushes, so a session sitting quietly idle never re-fires.
+    if [[ $live_status == idle ]] && should_notify_member "$name"; then
+      local pending_text
+      pending_text=$(jq -r --arg n "$name" '.pendingAnswers[$n] // ""' <<<"$marker")
+      if [[ -n $pending_text ]]; then
+        if ! is_terminal_focused "$name"; then
+          notify_generic_message "$name" "assistant" "$pending_text"
+          marker=$(jq --arg n "$name" '.unseen = ((.unseen // []) + [$n] | unique)' <<<"$marker")
+        fi
+        marker=$(jq --arg n "$name" 'del(.pendingAnswers[$n])' <<<"$marker")
+      fi
+    fi
   done <<<"$names"
 
   printf '%s' "$marker" > "$notify_marker_path"

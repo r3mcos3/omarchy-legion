@@ -34,18 +34,17 @@ install and get value from.
   headless pty), mark it done.
 - **Cronjobs** — read-only view of `cron-jobs.json`.
 - **Meldingen** — a desktop notification (`omarchy-notification-send`) + a
-  chime + a blink (the bar icon and that member's own roster row) for
-  basically every "vraag of antwoord" in any session: a task reply/done,
-  but also a plain question landing on a member (typed by hand, or a
-  cross-session message) and that member's own text answer — deliberately
-  broad, see "Standalone message detection" below. Suppressed only when
-  that specific member's own terminal window (opened via the panel's
-  "terminal" button) currently has focus — you're already looking at it.
-  Checked every 15s, independently of whether the panel is open. The chime
-  has its own on/off switch next to the "MELDINGEN" header
-  (`~/.config/omarchy/legion-settings.json`, `{"soundEnabled": ...}`) —
-  the desktop toast and blink stay on regardless, only the sound is
-  affected.
+  chime + a blink (the bar icon and that member's own roster row) for a
+  task reply/done, a member's own final answer once it's actually
+  finished, or a question (`AskUserQuestion`) it's waiting on you for —
+  see "Standalone message detection" below for exactly which of those
+  apply where. Suppressed only when that specific member's own terminal
+  window (opened via the panel's "terminal" button) currently has focus —
+  you're already looking at it. Checked every 15s, independently of
+  whether the panel is open. The chime has its own on/off switch next to
+  the "MELDINGEN" header (`~/.config/omarchy/legion-settings.json`,
+  `{"soundEnabled": ...}`) — the desktop toast and blink stay on
+  regardless, only the sound is affected.
 - **Verbruik** — 5h/7d rate-limit percentage from
   `~/.claude/usage-cache.json`, with exact reset times on hover.
 - **Lid toevoegen** — name + absolute workspace path (mkdir, sets
@@ -86,40 +85,55 @@ Finding one advances the oldest `in_progress` task for that member to
 `approved_questions` and fills in `.reply` — same rule as the webapp (a
 member works one task at a time).
 
-**2. "Vraag of antwoord" notifications — a question landing on a member, or
-its actual final answer.** A `type:"user"` entry (a prompt someone typed at
-that member, or a cross-session message addressed to it) fires immediately.
-A `type:"assistant"` text entry is trickier: a single turn can emit several
-of those — short "doing X now" updates alongside tool calls — before the
-real final answer, and only that last one is worth a notification. Text and
-a tool call are never in the same transcript entry here, so text presence
-alone can't tell them apart; what can is whether another assistant entry
-(necessarily a tool call, since that's the only thing that follows a
-mid-turn update) comes next, or the turn instead hands back to a real
-user/peer entry. So an assistant text candidate is held (`.pendingAnswers`
-in the marker, carried across polls) and only turned into a notification
-once a later poll confirms — a genuine next turn started — that it was
-never followed by more tool activity; a tool call arriving instead just
-discards it, no notification. A tool-result-only `user` entry (the
-mechanical feedback loop, not a real turn) confirms nothing either way.
+**2. "Vraag of antwoord" notifications — a member's actual final answer, or
+a question it's waiting on you for.** This one only fires for boss, or for
+a member whose "legion:<name>" terminal you currently have open yourself
+(`should_notify_member`) — a member worked purely through boss/tasks relay
+has no such window, and stays covered by job 1's own notification instead
+of also notifying separately for the same exchange (that's the "ik krijg
+gewoon een melding via jou" case).
 
-One tool call is an exception to "a tool call discards the pending
-candidate and nothing else happens": `AskUserQuestion`. It's a `tool_use`
-block, not text, so it would otherwise vanish the same way any other tool
-call does — but it is unambiguously a "this needs you right now" moment
-(the turn is blocked until you answer), arguably the clearest case of
-"vraag" this whole feature exists for. It fires its own `kind:"question"`
-message immediately, no confirm-on-next-turn wait, using the question
-text(s) from its `input.questions[]`.
+A `type:"assistant"` text entry is trickier than it looks: a single turn
+can emit several of those — short "doing X now" updates alongside tool
+calls — before the real final answer, and only that last one is worth a
+notification. Text and a tool call are never in the same transcript entry
+here, so text presence alone can't tell them apart. The first approach
+tried was structural — confirm a candidate final answer only once a
+*following* turn started — but that meant only finding out a member was
+done after Remco had already typed his next message to it, one turn too
+late for "let me know when you're finished" (reported directly, and
+reproducible). What actually works: a text-only assistant entry is held as
+an unconfirmed candidate (`.pendingAnswers` in the marker, carried across
+polls, cleared the moment a tool call follows it since that proves it
+wasn't final), and gets turned into a notification the moment that
+session's *live* status (`claude agents --json`) reads `idle` while a
+candidate is still sitting there unflushed — not a busy→idle *edge*, which
+a first attempt used and which missed the flush entirely whenever the
+status settled back to idle on an earlier poll than the one whose
+transcript scan actually caught the final text (confirmed live: an
+answer sat in `.pendingAnswers` indefinitely because no further edge ever
+came for it). Checking "idle now" plus "still pending" needs no per-session
+status history — `pending` itself is already the "is there anything new"
+signal, cleared the instant it flushes, so a session sitting quietly idle
+never re-fires.
+
+`AskUserQuestion` is an exception to "a tool call discards the pending
+candidate and nothing else happens": it's a `tool_use` block, not text, so
+it would otherwise vanish the same way any other tool call does — but it's
+unambiguously a "this needs you right now" moment (the turn is blocked
+until you answer), arguably the clearest case of "vraag" this whole
+feature exists for. It fires its own `kind:"question"` message
+immediately, no idle-wait needed, using the question text(s) from its
+`input.questions[]`.
 
 Either kind fires a desktop notification, plays a chime, and marks that
 member `unseen` (the blink), unless its terminal window currently has
-focus (see below). Two things never fire this way for boss specifically:
-its own peer-origin replies (job 1 above already gives those a nicer,
-task-specific notification), and a plain message straight from Remco —
-that's just this conversation, and there's no point notifying him about
-something he only just typed. Everything else, including boss's own final
-answer to you in chat, goes through this path.
+focus (see below). A plain message landing on a session — Remco typing
+directly, a task injected via `pty_send`, or a cross-session message
+arriving from boss/another peer — never fires this notification on its
+own, on any session, boss included: it's either self-inflicted (Remco just
+typed or sent it himself) or internal relay traffic already covered by job
+1 once the relayed exchange resolves.
 
 ### Focus check
 
