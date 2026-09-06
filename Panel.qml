@@ -3,6 +3,7 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
+import Quickshell.Hyprland
 import qs.Commons
 import qs.Ui
 
@@ -179,7 +180,62 @@ Panel {
   // rather than opening a duplicate one attached to the same session. See
   // cmd_terminal_open in bin/legionctl for the TUI.float / --title
   // "legion:<name>" matching convention this depends on.
-  function openTerminalFor(id, name) { runAction(["terminal", "open", name, id]) }
+  function openTerminalFor(id, name) {
+    runAction(["terminal", "open", name, id])
+    root.pendingTrackName = name
+    terminalTrackTimer.restart()
+  }
+
+  // --- click-outside-to-close for the floating terminal -----------------
+  //
+  // A newly-launched window isn't mapped yet the instant "terminal open"
+  // returns (confirmed live: ~1-2s), so this waits a beat, then asks
+  // legionctl for that member's window address and starts watching
+  // Hyprland's active toplevel. The moment focus moves to anything else —
+  // clicking elsewhere, another window, another workspace — that terminal
+  // is closed, the same as a quake-style dropdown terminal, instead of
+  // needing a keybinding every time.
+  property string pendingTrackName: ""
+  property string trackedTerminalName: ""
+  property string trackedTerminalAddress: ""
+
+  Timer {
+    id: terminalTrackTimer
+    interval: 1800
+    onTriggered: {
+      var name = root.pendingTrackName
+      runJson(["terminal", "find", name], function(code, text) {
+        if (code !== 0) return
+        try {
+          var v = JSON.parse(text)
+          if (v && v.address) {
+            root.trackedTerminalName = name
+            root.trackedTerminalAddress = v.address
+          }
+        } catch (e) { /* window never mapped (launch failed) — nothing to track */ }
+      })
+    }
+  }
+
+  // Quickshell's Hyprland.activeToplevel.address omits the "0x" prefix that
+  // `hyprctl clients -j` (and therefore legionctl's own address lookups)
+  // includes — confirmed live, the two would otherwise never match even for
+  // the same window. Normalize both sides before comparing.
+  function normalizeAddress(addr) { return String(addr || "").replace(/^0x/, "") }
+
+  Connections {
+    target: Hyprland
+    function onActiveToplevelChanged() {
+      if (!root.trackedTerminalAddress) return
+      var active = Hyprland.activeToplevel
+      var activeAddress = root.normalizeAddress(active ? active.address : "")
+      if (activeAddress === root.normalizeAddress(root.trackedTerminalAddress)) return
+      var closingName = root.trackedTerminalName
+      root.trackedTerminalName = ""
+      root.trackedTerminalAddress = ""
+      runAction(["terminal", "close", closingName])
+    }
+  }
 
   function startAll() { runAction(["start-all"]) }
 

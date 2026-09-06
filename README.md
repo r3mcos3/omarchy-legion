@@ -20,10 +20,15 @@ install and get value from.
 ## What it shows
 
 - **Roster** — every legion member (boss + fixed + dynamic), online/offline,
-  with a quick "start"/"stop" and an "terminal" button that opens a real
+  with a quick "start"/"stop" and a "terminal" button that opens a real
   terminal window running `claude attach <id>` (via Alacritty +
   Omarchy's `TUI.float` app-id) — the same way you'd talk to a member by
-  hand, just one click away instead of typing the command yourself.
+  hand, just one click away instead of typing the command yourself. A
+  second click on the same member reuses that window (moves it to your
+  current workspace and focuses it) instead of opening a duplicate, and
+  the window closes itself the moment focus moves anywhere else — no
+  keybinding needed to dismiss it, like a quake-style dropdown terminal.
+  See "Click-outside-to-close" below for how.
 - **Opdrachten (tasks)** — a flat list (not the webapp's drag-and-drop kanban
   board): create one, send it (typed live into the member's session via a
   headless pty), mark it done.
@@ -128,6 +133,28 @@ passes `--title "legion:<name>"` for this reason; a `claude attach` window
 opened any other way has no matching title and is simply never treated as
 "that member is on screen". No matching window, or no `hyprctl` at all,
 both mean "not focused" — the safe default is to notify.
+
+### Click-outside-to-close
+
+`cmd_terminal_open` in legionctl already dedupes a second click on the same
+member (moves the existing "legion:<name>" window to your current
+workspace and focuses it — see `find_terminal_window`/`hl.dsp.window.move`
++ `hl.dsp.focus`, the same Lua dispatch API the focus check above relies
+on). Making it disappear on its own works the other way round, from
+Panel.qml: `openTerminalFor()` starts a one-shot 1.8s timer (a freshly-
+launched window isn't mapped yet the instant the open call returns,
+confirmed live), then asks `legionctl terminal find NAME` for that
+window's address and starts watching Quickshell's `Hyprland.activeToplevel`
+for the plugin's own moves; the moment the active window's address stops
+matching the tracked one — click elsewhere, another window, another
+workspace — `legionctl terminal close NAME` closes it (a graceful
+`hl.dsp.window.close`, not a kill; detaching `claude attach` this way
+never stops the underlying session, same as Ctrl-]). One thing worth
+knowing if you ever touch this: `Hyprland.activeToplevel.address` (via
+Quickshell.Hyprland) omits the `0x` prefix that `hyprctl clients -j` (and
+so `legionctl`'s own address lookups) includes — confirmed live, address
+comparisons here normalize both sides or they'd never match even for the
+same window.
 
 ## What it deliberately does NOT do
 

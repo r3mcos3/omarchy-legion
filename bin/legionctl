@@ -17,7 +17,7 @@ usage_error() {
   tasks list --json | tasks add MEMBER TITLE | tasks send ID [MESSAGE] | tasks done ID |
   members add NAME CWD |
   session start|stop|restart NAME |
-  terminal open NAME AGENT_ID |
+  terminal open NAME AGENT_ID | terminal find NAME | terminal close NAME |
   settings --json | settings sound on|off |
   start-all'
 }
@@ -418,6 +418,32 @@ cmd_terminal_open() {
 
   setsid alacritty --class TUI.float --title "legion:$name" -e claude attach "$agent_id" >/dev/null 2>&1 &
   jq -n '{ok:true, note:"opened new window"}'
+}
+
+# Reports the hyprctl address of a member's currently-open terminal (or
+# null) — used by the panel to arm click-outside-to-close tracking a
+# moment after opening one, since a freshly-launched window isn't mapped
+# yet by the time cmd_terminal_open itself returns.
+cmd_terminal_find() {
+  local name=$1 addr
+  addr=$(find_terminal_window "$name")
+  jq -n --arg a "$addr" '{address: (if $a == "" then null else $a end)}'
+}
+
+# Closes a member's terminal (if one is open) — used when the panel
+# detects focus moved away from it, so clicking anywhere else makes it
+# disappear instead of needing a keybinding. A graceful close (asks the
+# window/app to quit), not a kill — claude attach just detaches the same
+# as it would from Ctrl-] or the window's own close button, which never
+# stops the underlying background session.
+cmd_terminal_close() {
+  local name=$1 addr
+  addr=$(find_terminal_window "$name")
+  if [[ -n $addr ]]; then
+    hyprctl dispatch "hl.dsp.window.close({ window = \"address:$addr\" })" \
+      >/dev/null 2>&1 || hyprctl dispatch closewindow "address:$addr" >/dev/null 2>&1 || true
+  fi
+  jq -n '{ok:true}'
 }
 
 notify_generic_message() {
@@ -955,6 +981,14 @@ case $command_name in
       open)
         (($# == 4)) || usage_error
         cmd_terminal_open "$3" "$4"
+        ;;
+      find)
+        (($# == 3)) || usage_error
+        cmd_terminal_find "$3"
+        ;;
+      close)
+        (($# == 3)) || usage_error
+        cmd_terminal_close "$3"
         ;;
       *) usage_error ;;
     esac
