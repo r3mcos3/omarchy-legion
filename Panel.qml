@@ -354,16 +354,6 @@ Panel {
     }
   }
 
-  Rectangle {
-    anchors.fill: button
-    anchors.margins: -Style.space(2)
-    radius: Math.max(4, Style.cornerRadius)
-    color: Util.alpha(Color.urgent, 0.30)
-    border.width: 1
-    border.color: Color.urgent
-    visible: root.offlineCount > 0
-  }
-
   // Blinks the bar icon itself instead of a numbered badge -- see
   // checkNotifications / RosterRow.isUnseen for the matching per-member
   // blink in the roster list below. Both stop the moment the panel opens.
